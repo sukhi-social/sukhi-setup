@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: check
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (errors only)
+        run: shellcheck -S error scripts/*.sh
+      - name: ruby syntax
+        run: ruby -v && ruby -wc bin/sukhi-render bin/sukhi-gitops-sync test/sync_test.rb
+      - name: tests
+        run: ruby test/sync_test.rb

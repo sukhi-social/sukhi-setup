@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=sukhi: pull sukhi-infra and apply changed Quadlet units
+OnFailure=sukhi-gitops-notify@%n.service
+# 二重に走らせない(スクリプトも flock するが、systemd でも oneshot は重ならない)
+
+[Service]
+Type=oneshot
+# 既定は --check(計画だけ。何も変えない)。適用に進むときは
+#   systemctl --user edit sukhi-gitops-sync.service
+# で Environment=SUKHI_GITOPS_MODE=--apply を足す。
+Environment=SUKHI_GITOPS_MODE=--check
+Environment=LANG=C.UTF-8
+# sukhi-infra を読み取り専用の deploy key で引く(prepare-user.sh が作る鍵)
+Environment="GIT_SSH_COMMAND=ssh -i %h/.ssh/sukhi-infra-deploy -o IdentitiesOnly=yes"
+ExecStart=%h/.local/bin/sukhi-gitops-sync ${SUKHI_GITOPS_MODE}
+TimeoutStartSec=15min

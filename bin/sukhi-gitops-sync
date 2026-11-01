@@ -1,0 +1,392 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# sukhi-infra の main を引いて、署名を確かめ、変わった Quadlet の unit だけ再起動する。
+# 設計: sukhi-fedi の docs/OPS_QUADLET_GITOPS.md §3。ユーザー sukhi の user unit として動く。
+#
+#   sukhi-gitops-sync [--check]                   # 既定。計画だけ。何も変えない
+#   sukhi-gitops-sync --apply [--clear-overrides]
+#   sukhi-gitops-sync status
+#   sukhi-gitops-sync forget-rejected             # 見送った commit をもう一度対象にする
+#
+# 設定は環境変数 > /etc/sukhi/gitops.env(SUKHI_GITOPS_ENV で別の場所)> 既定、の順。
+# 終了コード: 0 = 最新 / 計画 / 適用した、1 = 失敗(戻した)、2 = 信頼の確認を通らず何も変えていない。
+
+# unit やコメントに日本語が入る。systemd の user service は LANG が無い(US-ASCII)ことがあるので UTF-8 に決める
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = nil
+
+require "fileutils"
+require "open3"
+require "tmpdir"
+require "digest"
+
+# {{version}} / {{digest:*}} の埋め方は sukhi-render の一か所(ここでは再実装しない)
+load File.join(File.dirname(File.realpath(__FILE__)), "sukhi-render")
+
+module Sukhi
+  class Refused < StandardError; end # 信頼の確認を通らない(何も変えない)
+  class Failed < StandardError; end
+
+  class GitopsSync
+    # 同期スクリプトが読める sukhi.version の形式の版。manifest の requires-sync がこれより大きければ適用しない。
+    SYNC_API = 1
+    ZERO = "0" * 64
+    IMAGE_FORM = /\A[^@]+:[^@:\/]+@sha256:[0-9a-f]{64}\z/.freeze
+    DEFAULT_SIGNER_RE =
+      '^https://github\.com/sukhi-social/sukhi-fedi/\.github/workflows/' \
+      '(release\.yml@refs/tags/v.+|combined-sha\.yml@refs/heads/main)$'
+
+    def initialize(mode:, clear_overrides:, env: ENV)
+      @mode = mode
+      @clear = clear_overrides
+      @env = env
+      conf = read_conf(env.fetch("SUKHI_GITOPS_ENV", "/etc/sukhi/gitops.env"))
+      @cfg = ->(key, default = nil) { env[key] || conf[key] || default }
+      home = Dir.home
+      @sukhi_env = (@cfg.call("SUKHI_ENV") || read_file("/etc/sukhi/env")).to_s.strip
+      @infra = @cfg.call("INFRA_DIR", File.join(env["XDG_DATA_HOME"] || "#{home}/.local/share", "sukhi-infra"))
+      @quadlet = @cfg.call("QUADLET_DIR", File.join(env["XDG_CONFIG_HOME"] || "#{home}/.config", "containers/systemd"))
+      @state = @cfg.call("STATE_DIR", File.join(env["XDG_STATE_HOME"] || "#{home}/.local/state", "sukhi-gitops"))
+      @branch = @cfg.call("BRANCH", "main")
+      # ssh = git の ssh 署名(ALLOWED_SIGNERS)、gpg = gpg の鍵束、none = 確かめない(試験用。本番では使わない)
+      @verify_commits = @cfg.call("VERIFY_COMMITS", "ssh")
+      @allowed_signers = @cfg.call("ALLOWED_SIGNERS", "/etc/sukhi/allowed_signers")
+      @verify_images = @cfg.call("VERIFY_IMAGES", "1") == "1"
+      @signer_re = @cfg.call("SIGNER_RE", DEFAULT_SIGNER_RE)
+      @hold = Integer(@cfg.call("HOLD_SECS", "30"))
+      @notify_cmd = @cfg.call("NOTIFY_CMD", "")
+      @unit_order = @cfg.call("UNIT_ORDER", "sukhi-nats sukhi-gateway sukhi-web- sukhi-anubis").split
+      @applied = File.join(@state, "applied")
+    end
+
+    def call
+      FileUtils.mkdir_p(@state)
+      case @mode
+      when :status then return status
+      when :forget then return forget
+      end
+      refuse("SUKHI_ENV is empty (/etc/sukhi/env)") if @sukhi_env.empty?
+      refuse("no checkout at #{@infra} (run the setup's prepare-user.sh)") unless File.directory?(File.join(@infra, ".git"))
+
+      File.open(File.join(@state, "lock"), File::RDWR | File::CREAT, 0o644) do |lock|
+        unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+          log("another run is in progress")
+          return 0
+        end
+        sync
+      end
+    rescue Refused => e
+      notify("refused: #{e.message}")
+      2
+    rescue Sukhi::Render::Error => e
+      notify("refused: cannot render sukhi.version into the units: #{e.message}")
+      2
+    end
+
+    private
+
+    # ---- 小道具 -------------------------------------------------------------
+
+    def log(msg) = puts("sukhi-gitops-sync: #{msg}")
+
+    def notify(msg)
+      log("NOTIFY: #{msg}")
+      system(@notify_cmd, msg) unless @notify_cmd.to_s.empty?
+    end
+
+    def refuse(msg) = raise(Refused, msg)
+
+    def read_file(path)
+      File.read(path)
+    rescue SystemCallError
+      ""
+    end
+
+    def read_conf(path)
+      read_file(path).each_line.with_object({}) do |line, h|
+        m = line.match(/\A\s*([A-Z][A-Z0-9_]*)=(.*?)\s*\z/)
+        next unless m
+
+        h[m[1]] = m[2].sub(/\A(["'])(.*)\1\z/, '\2')
+      end
+    end
+
+    def state_file(name) = File.join(@state, name)
+
+    def read_state(name) = read_file(state_file(name)).strip
+
+    def git(*args) = Open3.capture2e("git", "-C", @infra, *args)
+
+    def git!(*args)
+      out, st = git(*args)
+      raise Failed, "git #{args.first} failed: #{out}" unless st.success?
+
+      out.strip
+    end
+
+    def sctl(*args) = system("systemctl", "--user", *args)
+
+    # ---- status / forget ----------------------------------------------------
+
+    def status
+      puts "env:        #{@sukhi_env.empty? ? '?' : @sukhi_env}"
+      puts "last-good:  #{read_state('last-good').then { |s| s.empty? ? '-' : s }}"
+      puts "rejected:   #{read_state('rejected').split.join(' ')}"
+      puts read_file(state_file("history")).lines.last(5).join
+      0
+    end
+
+    def forget
+      File.write(state_file("rejected"), "")
+      log("rejected list cleared")
+      0
+    end
+
+    # ---- 本体 ---------------------------------------------------------------
+
+    def sync
+      out, st = git("fetch", "-q", "origin", @branch)
+      raise Failed, "git fetch failed: #{out}" unless st.success?
+
+      target = git!("rev-parse", "origin/#{@branch}")
+      last = read_state("last-good")
+
+      if target == last
+        log("up to date (#{target})")
+        return 0
+      end
+      if read_state("rejected").split.include?(target)
+        log("target #{target} was rejected before; waiting for a newer commit")
+        return 0
+      end
+      if !last.empty? && !git("merge-base", "--is-ancestor", last, target).last.success?
+        refuse("history was rewritten (#{last} is not an ancestor of #{target})")
+      end
+
+      verify_commit(target)
+
+      Dir.mktmpdir("sukhi-sync") do |work|
+        new_dir = build_tree(work, target)
+        verify_images(new_dir)
+        plan = make_plan(work, new_dir)
+
+        log("target #{target[0, 12]} (last-good #{last[0, 12]}), env=#{@sukhi_env}")
+        log("restart: #{plan[:restart].empty? ? '(none)' : plan[:restart].join(' ')}")
+        log("stop (removed): #{plan[:gone].empty? ? '(none)' : plan[:gone].join(' ')}")
+        if @mode == :check
+          log("check only; nothing changed. run with --apply")
+          return 0
+        end
+        apply(new_dir, plan, target, last)
+      end
+    end
+
+    # --- 信頼 1: コミットの署名 ---
+    def verify_commit(target)
+      case @verify_commits
+      when "ssh"
+        ok = git("-c", "gpg.format=ssh", "-c", "gpg.ssh.allowedSignersFile=#{@allowed_signers}", "verify-commit", target).last.success?
+        refuse("commit #{target} has no valid signature from #{@allowed_signers}") unless ok
+      when "gpg"
+        refuse("commit #{target} has no valid gpg signature") unless git("verify-commit", target).last.success?
+      when "none"
+        log("WARNING: commit signatures are not checked (VERIFY_COMMITS=none)")
+      else
+        refuse("VERIFY_COMMITS must be ssh, gpg or none")
+      end
+    end
+
+    # target の base と overlays/<env> を重ねて平らにし、sukhi.version で埋める(チェックアウトはまだ進めない)
+    def build_tree(work, target)
+      tree = File.join(work, "tree")
+      new_dir = File.join(work, "new")
+      FileUtils.mkdir_p([tree, new_dir])
+      archive, st = Open3.capture2("git", "-C", @infra, "archive", target, "base", "overlays/#{@sukhi_env}", binmode: true)
+      refuse("cannot read base/ and overlays/#{@sukhi_env} from #{target}") unless st.success?
+      IO.popen(["tar", "-x", "-C", tree], "wb") { |io| io.write(archive) }
+      refuse("no base/ in #{target}") unless File.directory?(File.join(tree, "base"))
+      overlay = File.join(tree, "overlays", @sukhi_env)
+      refuse("no overlays/#{@sukhi_env} in #{target}") unless File.directory?(overlay)
+      FileUtils.cp_r(File.join(tree, "base", "."), new_dir)
+      FileUtils.cp_r(File.join(overlay, "."), new_dir)
+
+      manifest_path = File.join(new_dir, "sukhi.version")
+      refuse("no overlays/#{@sukhi_env}/sukhi.version in #{target}") unless File.file?(manifest_path)
+      manifest = Sukhi::Render.parse_manifest(manifest_path)
+      req = manifest["requires-sync"].to_s
+      refuse("sukhi.version has no valid requires-sync") unless req.match?(/\A\d+\z/)
+      if req.to_i > SYNC_API
+        refuse("sukhi.version needs sukhi-gitops-sync API #{req} (this one is #{SYNC_API}); update sukhi-setup first")
+      end
+      Sukhi::Render.render_dir(manifest_path, new_dir)
+      File.delete(manifest_path) # Quadlet のディレクトリには入れない
+      new_dir
+    end
+
+    # --- 信頼 2: 全 Image= の形と署名 ---
+    def verify_images(new_dir)
+      images = Dir.glob(File.join(new_dir, "**", "*")).select { |f| File.file?(f) }
+                  .flat_map { |f| File.readlines(f, chomp: true).grep(/\AImage=/).map { |l| l.sub("Image=", "") } }.uniq
+      verified = read_file(state_file("verified")).split("\n")
+      images.each do |img|
+        refuse("Image= must be <name>:<tag>@sha256:<digest>: #{img}") unless img.match?(IMAGE_FORM)
+        refuse("placeholder digest in #{img}") if img.end_with?("@sha256:#{ZERO}")
+        next unless @verify_images && img.start_with?("ghcr.io/sukhi-social/")
+
+        ref = "#{img.split('@').first.sub(/:[^:\/]+\z/, '')}@#{img.split('@').last}"
+        next if verified.include?(ref)
+
+        _, st = Open3.capture2e("cosign", "verify", "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
+                                "--certificate-identity-regexp", @signer_re, ref)
+        refuse("signature check failed for #{ref}") unless st.success?
+        File.open(state_file("verified"), "a") { |f| f.puts(ref) }
+      end
+    end
+
+    def tree_files(dir)
+      return {} unless File.directory?(dir)
+
+      Dir.glob(File.join(dir, "**", "*"), File::FNM_DOTMATCH).select { |f| File.file?(f) }
+         .to_h { |f| [f.delete_prefix("#{dir}/"), Digest::SHA256.file(f).hexdigest] }
+    end
+
+    def unit_of(file) = file.split("/").first.sub(/\.container(\.d)?\z/, "")
+
+    def make_plan(work, new_dir)
+      # 手で置かれた上書き(sukhi-swap-image.sh のドロップインなど)の検出
+      installed = tree_files(@quadlet)
+      applied = tree_files(@applied)
+      drift = File.directory?(@applied) ? applied != installed : !installed.empty?
+      if drift && !@clear
+        refuse("#{@quadlet} differs from what was last applied (manual overrides?). Review, then run with --apply --clear-overrides") if @mode == :apply
+
+        log("WARNING: #{@quadlet} differs from what was last applied; --apply needs --clear-overrides")
+      end
+      old = drift && @clear ? installed : applied
+
+      # 重ねて埋めたあとの差で見る(別の環境の変更では動かない)
+      cur = tree_files(new_dir)
+      changed = cur.select { |f, h| old[f] != h }.keys
+      removed = (old.keys - cur.keys)
+      added = cur.keys - old.keys
+
+      units = {}
+      changed.each do |f|
+        if f.match?(/\.container(\.d\/.*)?\z/)
+          units[unit_of(f)] = true
+        elsif f.match?(/\.(network|volume)\z/)
+          Dir.glob(File.join(new_dir, "*.container")).each do |c|
+            units[File.basename(c, ".container")] = true if File.read(c).include?(File.basename(f))
+          end
+        end
+      end
+
+      ordered = []
+      @unit_order.each do |pat|
+        units.keys.sort.each { |u| ordered << u if u.start_with?(pat) && !ordered.include?(u) }
+      end
+      ordered.concat((units.keys - ordered).sort)
+
+      {
+        restart: ordered,
+        new: added.select { |f| f.end_with?(".container") }.map { |f| unit_of(f) },
+        gone: removed.select { |f| f.end_with?(".container") }.map { |f| unit_of(f) },
+      }
+    end
+
+    # ---- 適用 ---------------------------------------------------------------
+
+    def swap_in(dir)
+      FileUtils.rm_rf("#{@quadlet}.next")
+      FileUtils.mkdir_p(File.dirname(@quadlet))
+      FileUtils.cp_r(dir, "#{@quadlet}.next")
+      FileUtils.rm_rf("#{@quadlet}.prev")
+      File.rename(@quadlet, "#{@quadlet}.prev") if File.exist?(@quadlet)
+      File.rename("#{@quadlet}.next", @quadlet)
+    end
+
+    def healthy?(unit)
+      return false unless system("systemctl", "--user", "is-active", "--quiet", "#{unit}.service")
+
+      out, = Open3.capture2e("podman", "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{end}}", unit)
+      status = out.strip
+      status.empty? || status == "healthy"
+    end
+
+    # 動いていれば再起動(try-restart)、新しい unit は起こす(restart)
+    def restart_set(plan)
+      plan[:restart].all? do |u|
+        plan[:new].include?(u) ? sctl("restart", "#{u}.service") : sctl("try-restart", "#{u}.service")
+      end
+    end
+
+    def apply(new_dir, plan, target, last)
+      plan[:gone].each { |u| sctl("stop", "#{u}.service") }
+      swap_in(new_dir)
+      ok = sctl("daemon-reload") && restart_set(plan)
+      if ok
+        sleep(@hold)
+        plan[:restart].each do |u|
+          next if healthy?(u)
+
+          ok = false
+          log("unit #{u} is not healthy")
+        end
+      end
+
+      if ok
+        FileUtils.rm_rf(@applied)
+        FileUtils.cp_r(new_dir, @applied)
+        git!("reset", "-q", "--hard", target)
+        File.write(state_file("last-good"), "#{target}\n")
+        File.open(state_file("history"), "a") do |f|
+          f.puts("#{Time.now.utc.strftime('%FT%TZ')} #{target} env=#{@sukhi_env} units=#{plan[:restart].join(' ')}")
+        end
+        notify("sync ok #{target[0, 12]} (#{plan[:restart].empty? ? 'no units changed' : plan[:restart].join(' ')})")
+        return 0
+      end
+
+      # 失敗: 見送りに記録して、前の状態に戻す(チェックアウトは進めていない)
+      File.open(state_file("rejected"), "a") { |f| f.puts(target) }
+      if File.directory?(@applied)
+        swap_in(@applied)
+        sctl("daemon-reload")
+        plan[:new].each { |u| sctl("stop", "#{u}.service") }
+        rolled = plan[:restart].reject { |u| plan[:new].include?(u) }.map { |u| sctl("try-restart", "#{u}.service") }.all?
+        if rolled
+          notify("sync rejected #{target[0, 12]}: unhealthy; rolled back to #{last[0, 12]}")
+        else
+          notify("sync rejected #{target[0, 12]} and ROLLBACK FAILED; manual action needed")
+        end
+      else
+        notify("sync rejected #{target[0, 12]}: unhealthy; nothing to roll back to (first apply)")
+      end
+      1
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  mode = :check
+  clear = false
+  args = ARGV.dup
+  case args.shift
+  when nil, "--check" then mode = :check
+  when "--apply" then mode = :apply
+  when "status" then mode = :status
+  when "forget-rejected" then mode = :forget
+  else
+    warn "usage: #{File.basename($PROGRAM_NAME)} [--check|--apply [--clear-overrides]|status|forget-rejected]"
+    exit 64
+  end
+  clear = true if args.first == "--clear-overrides"
+  begin
+    exit Sukhi::GitopsSync.new(mode: mode, clear_overrides: clear).call
+  rescue Sukhi::Failed => e
+    warn "sukhi-gitops-sync: #{e.message}"
+    exit 1
+  end
+end

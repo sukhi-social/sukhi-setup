@@ -1,0 +1,79 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Quadlet のファイルの {{version}} と {{digest:<name>}} を sukhi.version の値で埋める(その場で書き換える)。
+#   sukhi-render <sukhi.version> <dir>
+#
+# 埋め方を決める場所はここ一か所。同期スクリプト(箱)は load して使い、sukhi-infra の CI は
+# このコマンドか load で使う。知らない記法・manifest に無いキーは、黙って残さず失敗する
+# (Quadlet に {{...}} が渡らないように)。
+#
+# sukhi.version の形(1 行 1 項目。# 以降は注釈):
+#   requires-sync: 1
+#   version: 1.0.0                    # prod は semver、dev は sha-<commit>
+#   digest.combined: sha256:<64桁>    # {{digest:combined}} に入る
+
+# unit やコメントに日本語が入る。systemd の user service は LANG が無い(US-ASCII)ことがあるので UTF-8 に決める
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = nil
+
+module Sukhi
+  module Render
+    class Error < StandardError; end
+
+    EXTENSIONS = %w[.container .conf .volume .network].freeze
+    TOKEN = /\{\{([^}]*)\}\}/
+
+    def self.parse_manifest(path)
+      raise Error, "no manifest: #{path}" unless File.file?(path)
+
+      File.readlines(path, chomp: true).each_with_object({}) do |line, manifest|
+        m = line.sub(/#.*/, "").match(/\A\s*([A-Za-z0-9._-]+)\s*:\s*(.*?)\s*\z/)
+        manifest[m[1]] = m[2] if m
+      end
+    end
+
+    def self.render_text(text, manifest, where)
+      text.each_line.with_index(1).map do |line, no|
+        line.gsub(TOKEN) do
+          token = Regexp.last_match(1)
+          key =
+            if token == "version" then "version"
+            elsif (m = token.match(/\Adigest:([A-Za-z0-9._-]+)\z/)) then "digest.#{m[1]}"
+            else raise Error, "#{where}:#{no}: unknown token {{#{token}}}"
+            end
+          value = manifest[key]
+          raise Error, "#{where}:#{no}: #{key} is not in the manifest" if value.nil? || value.empty?
+
+          value
+        end
+      end.join
+    end
+
+    def self.render_dir(manifest_path, dir)
+      manifest = parse_manifest(manifest_path)
+      raise Error, "no directory: #{dir}" unless File.directory?(dir)
+
+      Dir.glob(File.join(dir, "**", "*")).sort.each do |file|
+        next unless File.file?(file) && EXTENSIONS.include?(File.extname(file))
+
+        File.write(file, render_text(File.read(file), manifest, file))
+      end
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  if ARGV.length != 2
+    warn "usage: #{File.basename($PROGRAM_NAME)} <sukhi.version> <dir>"
+    exit 64
+  end
+  begin
+    Sukhi::Render.render_dir(ARGV[0], ARGV[1])
+  rescue Sukhi::Render::Error => e
+    warn "sukhi-render: #{e.message}"
+    exit 2
+  end
+end
