@@ -11,7 +11,8 @@ Type=oneshot
 # で Environment=SUKHI_GITOPS_MODE=--apply を足す。
 Environment=SUKHI_GITOPS_MODE=--check
 Environment=LANG=C.UTF-8
-# sukhi-infra を読み取り専用の deploy key で引く(prepare-user.sh が作る鍵)
-Environment="GIT_SSH_COMMAND=ssh -i %h/.ssh/sukhi-infra-deploy -o IdentitiesOnly=yes"
+# sukhi-infra は public で、認証なしの https で引く。private に戻すときは、drop-in で
+#   Environment="GIT_SSH_COMMAND=ssh -i %h/.ssh/sukhi-infra-deploy -o IdentitiesOnly=yes"
+# を足し、読み取り専用の deploy key を登録する(prepare-user.sh が作る)
 ExecStart=%h/.local/bin/sukhi-gitops-sync ${SUKHI_GITOPS_MODE}
 TimeoutStartSec=15min

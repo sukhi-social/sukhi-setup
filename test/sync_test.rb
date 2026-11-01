@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # bin/sukhi-render と bin/sukhi-gitops-sync の試験。systemctl / podman / cosign は偽物に差し替える
-# (実機では何も動かさない)。署名(ssh / gpg)の検証は含まない(VERIFY_COMMITS=none)。実機で確かめる。
+# (実機では何も動かさない)。署名は、ssh は「署名なしを断る」だけ、gpg は実際の gpg で通る・断るを確かめる。それ以外は VERIFY_COMMITS=none。
 #   ruby test/sync_test.rb
 
 # unit やコメントに日本語が入る。systemd の user service は LANG が無い(US-ASCII)ことがあるので UTF-8 に決める
@@ -229,6 +229,51 @@ class SyncTest < Minitest::Test
     @env["ALLOWED_SIGNERS"] = File.join(@tmp, "allowed_signers")
     File.write(@env["ALLOWED_SIGNERS"], "")
     assert_equal 2, run_sync("--apply")
+    refute File.exist?(@quadlet)
+  end
+
+  # --- gpg: 専用の鍵束に入れた鍵の署名だけを許す(実際の gpg を使う) ---
+  def gpg_key(name)
+    home = File.join(@tmp, "gpg-#{name}")
+    FileUtils.mkdir_p(home, mode: 0o700)
+    sh("gpg", "-q", "--batch", "--passphrase", "", "--quick-gen-key", "#{name} <#{name}@t>", "ed25519", "sign", "never", env: { "GNUPGHOME" => home })
+    fpr = sh("gpg", "--list-keys", "--with-colons", name, env: { "GNUPGHOME" => home })[/^fpr:+([0-9A-F]+)/, 1]
+    [home, fpr]
+  end
+
+  def signed_commit(msg, home, fpr)
+    write(File.join(@src, "note"), msg)
+    sh("git", "add", "-A", dir: @src)
+    sh("git", "-c", "gpg.format=openpgp", "-c", "user.signingkey=#{fpr}", "commit", "-q", "-S", "-m", msg, dir: @src, env: { "GNUPGHOME" => home })
+    sh("git", "push", "-q", "origin", "main", dir: @src)
+  end
+
+  def gpg_env(home) = @env.merge("VERIFY_COMMITS" => "gpg", "GPG_HOME" => home)
+
+  def test_gpg_signed_commit_from_keyring_is_applied
+    skip "gpg がない" unless system("gpg --version >/dev/null 2>&1")
+    home, fpr = gpg_key("good")
+    signed_commit("c-signed", home, fpr)
+    @env = gpg_env(home)
+    assert_equal 0, run_sync("--apply"), @last_out
+    assert File.exist?(@quadlet)
+  end
+
+  def test_gpg_unsigned_commit_is_refused
+    skip "gpg がない" unless system("gpg --version >/dev/null 2>&1")
+    home, = gpg_key("good")
+    @env = gpg_env(home)
+    assert_equal 2, run_sync("--apply"), @last_out
+    refute File.exist?(@quadlet)
+  end
+
+  def test_gpg_commit_from_key_outside_keyring_is_refused
+    skip "gpg がない" unless system("gpg --version >/dev/null 2>&1")
+    evil_home, evil_fpr = gpg_key("evil")
+    signed_commit("c-evil", evil_home, evil_fpr)
+    good_home, = gpg_key("good")
+    @env = gpg_env(good_home)
+    assert_equal 2, run_sync("--apply"), @last_out
     refute File.exist?(@quadlet)
   end
 end
