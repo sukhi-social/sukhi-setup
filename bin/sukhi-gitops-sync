@@ -30,6 +30,9 @@ CONF="${SUKHI_GITOPS_ENV:-/etc/sukhi/gitops.env}"
 : "${SIGNER_RE:=^https://github\\.com/sukhi-social/sukhi-fedi/\\.github/workflows/(release\\.yml@refs/tags/v.+|combined-sha\\.yml@refs/heads/main)\$}"
 : "${HOLD_SECS:=30}"
 : "${NOTIFY_CMD:=}"
+# 同期スクリプトが読める sukhi.version の形式の版(manifest の requires-sync がこれより大きければ適用しない)
+: "${SYNC_API:=1}"
+: "${SUKHI_RENDER:=$(dirname "$(readlink -f "$0")")/sukhi-render}"
 # 依存の順。ここに無い unit は最後。
 : "${UNIT_ORDER:=sukhi-nats sukhi-gateway sukhi-web- sukhi-anubis}"
 
@@ -95,6 +98,15 @@ git -C "$INFRA_DIR" archive "$target" base "overlays/$SUKHI_ENV" | tar -x -C "$w
 [ -d "$work/tree/overlays/$SUKHI_ENV" ] || refuse "no overlays/$SUKHI_ENV in $target"
 cp -a "$work/tree/base/." "$work/new/"
 cp -a "$work/tree/overlays/$SUKHI_ENV/." "$work/new/"
+
+# --- 版の manifest: 読める形式か、{{version}} / {{digest:*}} を埋める。manifest は Quadlet のディレクトリには入れない ---
+manifest="$work/new/sukhi.version"
+[ -f "$manifest" ] || refuse "no overlays/$SUKHI_ENV/sukhi.version in $target"
+req=$(awk -F: '/^[ \t]*requires-sync[ \t]*:/ {gsub(/[ \t]/, "", $2); print $2}' "$manifest")
+case "${req:-}" in ''|*[!0-9]*) refuse "sukhi.version has no valid requires-sync" ;; esac
+[ "$req" -le "$SYNC_API" ] || refuse "sukhi.version needs sukhi-gitops-sync API $req (this one is $SYNC_API); update sukhi-setup first"
+"$SUKHI_RENDER" "$manifest" "$work/new" || refuse "cannot render sukhi.version into the units"
+rm -f "$manifest"
 
 # --- 信頼 2: 全 Image= の形と署名 ---
 images=$(grep -rh '^Image=' "$work/new" | sed 's/^Image=//' | sort -u)

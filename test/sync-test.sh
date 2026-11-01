@@ -29,10 +29,13 @@ export PATH="$T/bin:$PATH" FAKE_LOG="$T/calls"; : >"$FAKE_LOG"
 git init -q --bare "$T/origin.git"
 git init -q "$T/src"; cd "$T/src"; git config user.email t@t; git config user.name t
 mkdir -p base overlays/test/sukhi-gateway.container.d overlays/other/sukhi-gateway.container.d
+# nats は第三者の image(そのまま)。sukhi の image は {{version}} / {{digest:*}}
 mk() { printf '[Unit]\nDescription=%s\n\n[Container]\nImage=%s\n' "$1" "$2" >"base/$1.container"; }
 mk sukhi-nats   "docker.io/library/nats:2-alpine@sha256:$D1"
-mk sukhi-gateway "ghcr.io/sukhi-social/sukhi-fedi-combined:sha-aaaaaaa@sha256:$D1"
-mk sukhi-web-next "ghcr.io/sukhi-social/sukhi-fedi-web-next:sha-aaaaaaa@sha256:$D1"
+mk sukhi-gateway "ghcr.io/sukhi-social/sukhi-fedi-combined:{{version}}@{{digest:combined}}"
+mk sukhi-web-next "ghcr.io/sukhi-social/sukhi-fedi-web-next:{{version}}@{{digest:web-next}}"
+manifest() { printf 'requires-sync: 1\nversion: %s   # 注釈\ndigest.combined: sha256:%s\ndigest.web-next: sha256:%s\n' "$2" "$3" "$4" >"overlays/$1/sukhi.version"; }
+manifest test sha-aaaaaaa "$D1" "$D1"; manifest other sha-aaaaaaa "$D1" "$D1"
 printf '[Container]\nEnvironment=DOMAIN=test.invalid\n' >overlays/test/sukhi-gateway.container.d/override.conf
 printf '[Container]\nEnvironment=DOMAIN=other.invalid\n' >overlays/other/sukhi-gateway.container.d/override.conf
 git add -A; git commit -qm c1; git branch -M main; git remote add origin "$T/origin.git"; git push -q origin main
@@ -63,32 +66,46 @@ cd "$T/src"; printf '[Container]\nEnvironment=DOMAIN=other2.invalid\n' >overlays
 git commit -qam c2; git push -q origin main
 : >"$FAKE_LOG"; "$S" --apply >/dev/null; [ -z "$(calls)" ] || fail "other env change restarted: $(calls)"; ok "other env change restarts nothing"
 
-# 5. gateway の image だけ変える → gateway だけ try-restart
-cd "$T/src"; sed -i "s/$D1/$D2/" base/sukhi-gateway.container; git commit -qam c3; git push -q origin main
+# 5. manifest の combined のダイジェストだけ変える → gateway だけ try-restart(web-next と nats は動かない)
+cd "$T/src"; manifest test sha-aaaaaaa "$D2" "$D1"; git commit -qam c3; git push -q origin main
 : >"$FAKE_LOG"; "$S" --apply >/dev/null
 [ "$(calls)" = "--user try-restart sukhi-gateway.service;" ] || fail "only gateway expected: $(calls)"; ok "only the changed unit is try-restarted"
 good=$(cat "$STATE_DIR/last-good")
 
-# 6. 不健康 → 戻す・見送り・last-good は進まない
-cd "$T/src"; sed -i "s/sha-aaaaaaa@sha256:$D1/sha-bbbbbbb@sha256:$D2/" base/sukhi-web-next.container; git commit -qam c4; git push -q origin main
+# 6. 版を上げる(gateway と web-next が動く。nats は動かない)が、web-next が不健康 → 戻す・見送り・last-good は進まない
+cd "$T/src"; manifest test sha-bbbbbbb "$D2" "$D2"; git commit -qam c4; git push -q origin main
 : >"$FAKE_LOG"; FAKE_UNHEALTHY=sukhi-web-next "$S" --apply >/dev/null && fail "unhealthy apply returned 0" || true
 [ "$(cat "$STATE_DIR/last-good")" = "$good" ] || fail "last-good moved"
 grep -q "sha-aaaaaaa" "$QUADLET_DIR/sukhi-web-next.container" || fail "not rolled back"
+grep -q "restart sukhi-gateway.service" "$FAKE_LOG" && grep -q "restart sukhi-web-next.service" "$FAKE_LOG" && ! grep -q "nats" "$FAKE_LOG" || fail "version bump restarted the wrong units: $(calls)"
 grep -q "$(git -C "$T/infra" rev-parse origin/main)" "$STATE_DIR/rejected" || fail "not recorded as rejected"
 ok "unhealthy → rolled back, rejected, last-good unchanged"
 : >"$FAKE_LOG"; "$S" --apply >/dev/null; [ -z "$(calls)" ] || fail "retried a rejected commit"; ok "rejected commit is not retried"
 
 # 7. 仮のダイジェスト → 拒否(2)で何も変えない
-cd "$T/src"; sed -i "s/$D1/$Z/" base/sukhi-nats.container; git commit -qam c5; git push -q origin main
+cd "$T/src"; manifest test sha-ccccccc "$Z" "$D2"; git commit -qam c5; git push -q origin main
 : >"$FAKE_LOG"; rc=0; "$S" --apply >/dev/null || rc=$?
 [ "$rc" = 2 ] && [ -z "$(calls)" ] || fail "placeholder not refused (rc=$rc)"; ok "placeholder digest refused (rc 2)"
 
 # 8. 手で置かれた上書き → --clear-overrides が要る
-cd "$T/src"; sed -i "s/$Z/$D1/" base/sukhi-nats.container; git commit -qam c6; git push -q origin main
+cd "$T/src"; manifest test sha-ccccccc "$D1" "$D2"; git commit -qam c6; git push -q origin main
 "$S" forget-rejected >/dev/null
 mkdir -p "$QUADLET_DIR/sukhi-gateway.container.d"; printf '[Container]\nImage=localhost/x\n' >"$QUADLET_DIR/sukhi-gateway.container.d/10-image.conf"
 rc=0; "$S" --apply >/dev/null || rc=$?; [ "$rc" = 2 ] || fail "drift not refused (rc=$rc)"
 "$S" --apply --clear-overrides >/dev/null || fail "clear-overrides failed"
 [ ! -e "$QUADLET_DIR/sukhi-gateway.container.d/10-image.conf" ] || fail "override not cleared"; ok "manual override needs --clear-overrides"
+
+# 9. sukhi.version が新しい形式(requires-sync が大きい)→ 拒否して何も変えない
+cd "$T/src"; manifest test sha-ddddddd "$D1" "$D2"; sed -i 's/requires-sync: 1/requires-sync: 99/' overlays/test/sukhi.version; git commit -qam c7; git push -q origin main
+: >"$FAKE_LOG"; rc=0; "$S" --apply >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && [ -z "$(calls)" ] || fail "newer manifest format not refused (rc=$rc)"; ok "requires-sync newer than this script is refused"
+
+# 10. manifest にキーが無い({{digest:web-next}} が埋まらない)→ 拒否
+cd "$T/src"; manifest test sha-eeeeeee "$D1" "$D2"; sed -i '/digest.web-next/d' overlays/test/sukhi.version; git commit -qam c8; git push -q origin main
+: >"$FAKE_LOG"; rc=0; "$S" --apply >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && [ -z "$(calls)" ] || fail "missing digest key not refused (rc=$rc)"; ok "unfilled {{digest:*}} is refused"
+
+# 11. sukhi.version は Quadlet のディレクトリに入らず、{{ }} も残らない
+! grep -rq '{{' "$QUADLET_DIR" && [ ! -e "$QUADLET_DIR/sukhi.version" ] || fail "manifest or tokens leaked into the Quadlet dir"; ok "no manifest or tokens in the Quadlet dir"
 
 echo "all $n passed"

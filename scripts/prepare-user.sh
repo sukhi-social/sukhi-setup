@@ -15,7 +15,7 @@ INFRA_DIR="${INFRA_DIR:-$HOME/.local/share/sukhi-infra}"
 
 # 1. 置き場所
 mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user" "$HOME/.config/containers/systemd" "$HOME/.local/state/sukhi-gitops"
-install -m 755 "$here/bin/sukhi-gitops-sync" "$HOME/.local/bin/sukhi-gitops-sync"
+install -m 755 "$here/bin/sukhi-gitops-sync" "$here/bin/sukhi-render" "$HOME/.local/bin/"
 install -m 644 "$here"/systemd/user/* "$HOME/.config/systemd/user/"
 
 # 2. sukhi-infra を引くための読み取り専用 deploy key(書き込み権限は付けない)

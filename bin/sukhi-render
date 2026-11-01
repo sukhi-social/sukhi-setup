@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Quadlet のファイルの {{version}} と {{digest:<name>}} を sukhi.version の値で埋める(その場で書き換える)。
+#   sukhi-render <sukhi.version> <dir>
+#
+# 埋め方を決める場所はここ一か所。同期スクリプト(箱)も、sukhi-infra の CI も、これを使う。
+# 知らない記法・manifest に無いキーは、黙って残さず失敗する(Quadlet に {{...}} が渡らないように)。
+#
+# sukhi.version の形(1 行 1 項目。# 以降は注釈):
+#   requires-sync: 1
+#   version: 1.0.0                    # prod は semver、dev は sha-<commit>
+#   digest.combined: sha256:<64桁>    # {{digest:combined}} に入る
+set -euo pipefail
+manifest="${1:?usage: $0 <sukhi.version> <dir>}"; dir="${2:?usage: $0 <sukhi.version> <dir>}"
+[ -f "$manifest" ] || { echo "sukhi-render: no manifest: $manifest" >&2; exit 2; }
+[ -d "$dir" ] || { echo "sukhi-render: no directory: $dir" >&2; exit 2; }
+
+while IFS= read -r -d '' f; do
+  if ! awk -v M="$manifest" -v F="$f" '
+    BEGIN {
+      while ((getline l < M) > 0) {
+        sub(/#.*/, "", l)
+        if (match(l, /^[ \t]*[A-Za-z0-9._-]+[ \t]*:/)) {
+          k = substr(l, 1, RLENGTH - 1); v = substr(l, RLENGTH + 1)
+          gsub(/^[ \t]+|[ \t]+$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", v)
+          m[k] = v
+        }
+      }
+    }
+    {
+      out = $0
+      while (match(out, /\{\{[^}]*\}\}/)) {
+        tok = substr(out, RSTART + 2, RLENGTH - 4)
+        if (tok == "version") key = "version"
+        else if (tok ~ /^digest:[A-Za-z0-9._-]+$/) key = "digest." substr(tok, 8)
+        else { print "sukhi-render: " F ":" NR ": unknown token {{" tok "}}" > "/dev/stderr"; exit 2 }
+        if (!(key in m) || m[key] == "") { print "sukhi-render: " F ":" NR ": " key " is not in the manifest" > "/dev/stderr"; exit 2 }
+        out = substr(out, 1, RSTART - 1) m[key] substr(out, RSTART + RLENGTH)
+      }
+      print out
+    }' "$f" >"$f.render"; then
+    rm -f "$f.render"; exit 2
+  fi
+  mv "$f.render" "$f"
+done < <(find "$dir" -type f \( -name '*.container' -o -name '*.conf' -o -name '*.volume' -o -name '*.network' \) -print0)

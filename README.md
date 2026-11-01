@@ -18,6 +18,7 @@ sukhi の箱(Rocky Linux、Podman rootless、専用ユーザー `sukhi`)を**準
 | `docs/PREPARE.md` | 準備の手順(上から順に) |
 | `scripts/prepare-root.sh` | root が要る部分: ユーザー、linger、cgroup 委譲、journal、`/etc/sukhi` |
 | `scripts/prepare-user.sh` | `sukhi` でやる部分: deploy key、infra の clone、`podman secret`、timer |
+| `bin/sukhi-render` | `sukhi.version` の値で `{{version}}` / `{{digest:<name>}}` を埋める。**埋め方を決める唯一の場所**(箱の同期も sukhi-infra の CI もこれを使う) |
 | `bin/sukhi-gitops-sync` | 引く → 署名を確かめる → 変わった unit だけ再起動 → ヘルスを待つ → 失敗なら戻す |
 | `systemd/user/` | 同期の service / timer(既定は `--check`)、失敗の通知 |
 | `systemd/system/user@.service.d/delegate.conf` | rootless の cgroup 委譲(cpu を含める) |
@@ -27,7 +28,7 @@ sukhi の箱(Rocky Linux、Podman rootless、専用ユーザー `sukhi`)を**準
 ## 試験
 
 ```sh
-test/sync-test.sh      # 9 項目。実機では何も動かさない
+test/sync-test.sh      # 12 項目。実機では何も動かさない
 ```
 
 署名(ssh / gpg)の検証と、実際の Podman・Quadlet・Cockpit は**含まれない**。箱で確かめる(docs/PREPARE.md §7)。

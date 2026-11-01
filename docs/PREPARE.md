@@ -83,6 +83,8 @@ sukhi-gitops-sync --check             # 何が変わるか。署名・Image= の
 journalctl --user -u sukhi-gitops-sync -n 30
 ```
 
+- 版は sukhi-infra の `overlays/<env>/sukhi.version` に書かれ、同期スクリプトが unit の `{{version}}` / `{{digest:*}}` に埋める。
+  `requires-sync` がこの スクリプトの版より大きいと適用しない(先に sukhi-setup を更新する)。
 - **仮のダイジェスト(0 埋め)は適用されない。** 最初の bump PR(4 つの image が同じ sha で本物になる)がマージされてから先へ。
 - 適用に進む: `systemctl --user edit sukhi-gitops-sync.service` で `[Service]` に `Environment=SUKHI_GITOPS_MODE=--apply`。
 - 最初の適用の前に、`~/.config/containers/systemd/` に手で置いたものがあれば `--apply --clear-overrides` が要る(手で置いたものは消える)。
