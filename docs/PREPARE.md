@@ -66,7 +66,7 @@ scripts/prepare-user.sh --enable-timer   # 2 回目: infra を clone、podman se
 
 ```sh
 umask 077
-printf '%s' "$(read -rsp 'SMTP password: ' p; echo "$p")" | podman secret create smtp_password -
+read -rsp 'SMTP password: ' p; echo; printf '%s' "$p" | podman secret create smtp_password -; unset p
 podman secret ls                      # 名前だけ。値は出ない
 ```
 
