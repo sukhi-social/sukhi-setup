@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# sukhi-infra の main を引いて、署名を確かめ、変わった Quadlet の unit だけ再起動する。
+# 設計: sukhi-fedi の docs/OPS_QUADLET_GITOPS.md §3。ユーザー sukhi の user unit として動く。
+#
+#   sukhi-gitops-sync [--check]            # 既定。計画だけ。何も変えない
+#   sukhi-gitops-sync --apply [--clear-overrides]
+#   sukhi-gitops-sync status
+#   sukhi-gitops-sync forget-rejected      # 見送った commit をもう一度対象にする
+#
+# 設定は /etc/sukhi/gitops.env(SUKHI_GITOPS_ENV で別の場所)。環境変数でも上書きできる。
+# 終了コード: 0 = 最新 / 計画 / 適用した、1 = 失敗(戻した)、2 = 信頼の確認を通らず何も変えていない。
+
+set -euo pipefail
+
+CONF="${SUKHI_GITOPS_ENV:-/etc/sukhi/gitops.env}"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+: "${SUKHI_ENV:=$(cat /etc/sukhi/env 2>/dev/null || true)}"
+: "${INFRA_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/sukhi-infra}"
+: "${QUADLET_DIR:=${XDG_CONFIG_HOME:-$HOME/.config}/containers/systemd}"
+: "${STATE_DIR:=${XDG_STATE_HOME:-$HOME/.local/state}/sukhi-gitops}"
+: "${BRANCH:=main}"
+# ssh = git の ssh 署名(ALLOWED_SIGNERS)、gpg = gpg の鍵束(GNUPGHOME)、none = 確かめない(試験用。本番では使わない)
+: "${VERIFY_COMMITS:=ssh}"
+: "${ALLOWED_SIGNERS:=/etc/sukhi/allowed_signers}"
+: "${VERIFY_IMAGES:=1}"
+: "${SIGNER_RE:=^https://github\\.com/sukhi-social/sukhi-fedi/\\.github/workflows/(release\\.yml@refs/tags/v.+|combined-sha\\.yml@refs/heads/main)\$}"
+: "${HOLD_SECS:=30}"
+: "${NOTIFY_CMD:=}"
+# 依存の順。ここに無い unit は最後。
+: "${UNIT_ORDER:=sukhi-nats sukhi-gateway sukhi-web- sukhi-anubis}"
+
+mode=check; clear_overrides=0
+case "${1:-}" in
+  ""|--check) mode=check ;;
+  --apply) mode=apply ;;
+  status) mode=status ;;
+  forget-rejected) mode=forget ;;
+  *) echo "usage: $0 [--check|--apply [--clear-overrides]|status|forget-rejected]" >&2; exit 64 ;;
+esac
+shift || true
+[ "${1:-}" = "--clear-overrides" ] && clear_overrides=1
+
+ZERO=$(printf '0%.0s' $(seq 64))
+SCTL=(systemctl --user)
+APPLIED="$STATE_DIR/applied"
+mkdir -p "$STATE_DIR"
+
+log()    { echo "sukhi-gitops-sync: $*"; }
+notify() { log "NOTIFY: $*"; [ -n "$NOTIFY_CMD" ] && "$NOTIFY_CMD" "$*" || true; }
+refuse() { notify "refused: $*"; exit 2; }
+
+if [ "$mode" = status ]; then
+  echo "env:        ${SUKHI_ENV:-?}"
+  echo "last-good:  $(cat "$STATE_DIR/last-good" 2>/dev/null || echo -)"
+  echo "rejected:   $(tr '\n' ' ' <"$STATE_DIR/rejected" 2>/dev/null || true)"
+  tail -n 5 "$STATE_DIR/history" 2>/dev/null || true
+  exit 0
+fi
+if [ "$mode" = forget ]; then : >"$STATE_DIR/rejected"; log "rejected list cleared"; exit 0; fi
+
+[ -n "$SUKHI_ENV" ] || refuse "SUKHI_ENV is empty (/etc/sukhi/env)"
+[ -d "$INFRA_DIR/.git" ] || refuse "no checkout at $INFRA_DIR (run the setup's prepare-user.sh)"
+
+exec 9>"$STATE_DIR/lock"
+flock -n 9 || { log "another run is in progress"; exit 0; }
+
+git -C "$INFRA_DIR" fetch -q origin "$BRANCH"
+target=$(git -C "$INFRA_DIR" rev-parse "origin/$BRANCH")
+last=$(cat "$STATE_DIR/last-good" 2>/dev/null || true)
+
+if [ "$target" = "$last" ]; then log "up to date ($target)"; exit 0; fi
+if grep -qx "$target" "$STATE_DIR/rejected" 2>/dev/null; then log "target $target was rejected before; waiting for a newer commit"; exit 0; fi
+if [ -n "$last" ] && ! git -C "$INFRA_DIR" merge-base --is-ancestor "$last" "$target"; then
+  refuse "history was rewritten ($last is not an ancestor of $target)"
+fi
+
+# --- 信頼 1: コミットの署名 ---
+case "$VERIFY_COMMITS" in
+  ssh) git -C "$INFRA_DIR" -c gpg.format=ssh -c "gpg.ssh.allowedSignersFile=$ALLOWED_SIGNERS" verify-commit "$target" >/dev/null 2>&1 \
+         || refuse "commit $target has no valid signature from $ALLOWED_SIGNERS" ;;
+  gpg) git -C "$INFRA_DIR" verify-commit "$target" >/dev/null 2>&1 || refuse "commit $target has no valid gpg signature" ;;
+  none) log "WARNING: commit signatures are not checked (VERIFY_COMMITS=none)" ;;
+  *) refuse "VERIFY_COMMITS must be ssh, gpg or none" ;;
+esac
+
+# --- 作業場所: target の base と overlays/<env> を重ねて平らにする(チェックアウトはまだ進めない) ---
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/tree" "$work/new"
+git -C "$INFRA_DIR" archive "$target" base "overlays/$SUKHI_ENV" | tar -x -C "$work/tree"
+[ -d "$work/tree/base" ] || refuse "no base/ in $target"
+[ -d "$work/tree/overlays/$SUKHI_ENV" ] || refuse "no overlays/$SUKHI_ENV in $target"
+cp -a "$work/tree/base/." "$work/new/"
+cp -a "$work/tree/overlays/$SUKHI_ENV/." "$work/new/"
+
+# --- 信頼 2: 全 Image= の形と署名 ---
+images=$(grep -rh '^Image=' "$work/new" | sed 's/^Image=//' | sort -u)
+while IFS= read -r img; do
+  [ -n "$img" ] || continue
+  [[ "$img" =~ ^[^@]+:[^@:/]+@sha256:[0-9a-f]{64}$ ]] || refuse "Image= must be <name>:<tag>@sha256:<digest>: $img"
+  [[ "$img" == *"@sha256:$ZERO" ]] && refuse "placeholder digest in $target: $img"
+  if [ "$VERIFY_IMAGES" = 1 ]; then
+    case "$img" in ghcr.io/sukhi-social/*) ;; *) continue ;; esac
+    ref="${img%@*}"; ref="${ref%:*}@${img##*@}"
+    grep -qxF "$ref" "$STATE_DIR/verified" 2>/dev/null && continue
+    cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp "$SIGNER_RE" "$ref" >/dev/null 2>&1 || refuse "signature check failed for $ref"
+    echo "$ref" >>"$STATE_DIR/verified"
+  fi
+done <<<"$images"
+
+# --- 手で置かれた上書き(sukhi-swap-image.sh のドロップインなど)の検出 ---
+drift=0
+if [ -d "$APPLIED" ]; then
+  diff -rq "$APPLIED" "$QUADLET_DIR" >/dev/null 2>&1 || drift=1
+elif [ -d "$QUADLET_DIR" ] && [ -n "$(ls -A "$QUADLET_DIR" 2>/dev/null)" ]; then
+  drift=1
+fi
+if [ "$drift" = 1 ] && [ "$clear_overrides" = 0 ]; then
+  [ "$mode" = apply ] && refuse "$QUADLET_DIR differs from what was last applied (manual overrides?). Review, then run with --apply --clear-overrides"
+  log "WARNING: $QUADLET_DIR differs from what was last applied; --apply needs --clear-overrides"
+fi
+
+# --- どの unit が変わるか(重ねたあとの差で見る。別の環境の変更では動かない) ---
+base_cmp="$APPLIED"; [ -d "$base_cmp" ] || base_cmp="$work/empty"; mkdir -p "$work/empty"
+[ "$drift" = 1 ] && [ "$clear_overrides" = 1 ] && [ -d "$QUADLET_DIR" ] && base_cmp="$QUADLET_DIR"
+filelist() { (cd "$1" && find . -type f | sed 's#^\./##' | sort); }
+changed=(); removed=(); added=()
+while IFS= read -r f; do
+  if [ ! -f "$base_cmp/$f" ]; then changed+=("$f"); added+=("$f")
+  elif ! cmp -s "$base_cmp/$f" "$work/new/$f"; then changed+=("$f"); fi
+done < <(filelist "$work/new")
+while IFS= read -r f; do [ -f "$work/new/$f" ] || removed+=("$f"); done < <([ -d "$base_cmp" ] && filelist "$base_cmp" || true)
+
+# ファイル → unit 名(.container と .container.d/ は <name>.service)。.network / .volume は使う unit を足す。
+declare -A units=()
+unit_of() { local f=$1 n; n=${f%%/*}; n=${n%.container.d}; n=${n%.container}; echo "$n"; }
+for f in "${changed[@]}"; do
+  case "$f" in
+    *.container|*.container.d/*) units["$(unit_of "$f")"]=1 ;;
+    *.network|*.volume)
+      res=${f##*/}
+      for c in "$work"/new/*.container; do grep -qF "$res" "$c" && units["$(basename "$c" .container)"]=1; done ;;
+  esac
+done
+newunits=(); for f in "${added[@]}"; do case "$f" in *.container) newunits+=("$(unit_of "$f")") ;; esac; done
+gone=()
+for f in "${removed[@]}"; do case "$f" in *.container) gone+=("$(unit_of "$f")") ;; esac; done
+
+ordered=()
+for pat in $UNIT_ORDER; do for u in "${!units[@]}"; do case "$u" in "$pat"*) ordered+=("$u"); unset 'units[$u]' ;; esac; done; done
+for u in "${!units[@]}"; do ordered+=("$u"); done
+
+log "target ${target:0:12} (last-good ${last:0:12}), env=$SUKHI_ENV"
+log "restart: ${ordered[*]:-(none)}"; log "stop (removed): ${gone[*]:-(none)}"
+
+if [ "$mode" = check ]; then log "check only; nothing changed. run with --apply"; exit 0; fi
+
+# --- 適用 ---
+swap_in() {   # $1 = 入れるディレクトリ
+  rm -rf "$QUADLET_DIR.next"; mkdir -p "$(dirname "$QUADLET_DIR")"
+  cp -a "$1" "$QUADLET_DIR.next"
+  rm -rf "$QUADLET_DIR.prev"; [ -e "$QUADLET_DIR" ] && mv "$QUADLET_DIR" "$QUADLET_DIR.prev"
+  mv "$QUADLET_DIR.next" "$QUADLET_DIR"
+}
+healthy() {
+  local u=$1 st
+  "${SCTL[@]}" is-active --quiet "$u.service" || return 1
+  st=$(podman inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$u" 2>/dev/null || true)
+  [ -z "$st" ] || [ "$st" = healthy ]
+}
+is_new() { local x; for x in "${newunits[@]}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
+restart_set() {   # 引数: unit 名。動いていれば再起動(try-restart)、新しい unit は起こす(restart)。
+  local u
+  for u in "$@"; do
+    if is_new "$u"; then "${SCTL[@]}" restart "$u.service" || return 1
+    else "${SCTL[@]}" try-restart "$u.service" || return 1; fi
+  done
+}
+
+for u in "${gone[@]}"; do "${SCTL[@]}" stop "$u.service" || true; done
+swap_in "$work/new"
+if ! { "${SCTL[@]}" daemon-reload && restart_set "${ordered[@]}"; }; then ok=0; else
+  ok=1; sleep "$HOLD_SECS"
+  for u in "${ordered[@]}"; do healthy "$u" || { ok=0; log "unit $u is not healthy"; }; done
+fi
+
+if [ "$ok" = 1 ]; then
+  rm -rf "$APPLIED"; cp -a "$work/new" "$APPLIED"
+  git -C "$INFRA_DIR" reset -q --hard "$target"
+  echo "$target" >"$STATE_DIR/last-good"
+  printf '%s %s env=%s units=%s\n' "$(date -u +%FT%TZ)" "$target" "$SUKHI_ENV" "${ordered[*]:-}" >>"$STATE_DIR/history"
+  notify "sync ok ${target:0:12} (${ordered[*]:-no units changed})"
+  exit 0
+fi
+
+# --- 失敗: 見送りに記録して、前の状態に戻す(チェックアウトは進めていない) ---
+echo "$target" >>"$STATE_DIR/rejected"
+if [ -d "$APPLIED" ]; then
+  swap_in "$APPLIED"
+  "${SCTL[@]}" daemon-reload || true
+  rb=0
+  for u in "${newunits[@]}"; do "${SCTL[@]}" stop "$u.service" || true; done
+  for u in "${ordered[@]}"; do is_new "$u" && continue; "${SCTL[@]}" try-restart "$u.service" || rb=1; done
+  if [ "$rb" = 1 ]; then notify "sync rejected ${target:0:12} and ROLLBACK FAILED; manual action needed"; exit 1; fi
+  notify "sync rejected ${target:0:12}: unhealthy; rolled back to ${last:0:12}"
+else
+  notify "sync rejected ${target:0:12}: unhealthy; nothing to roll back to (first apply)"
+fi
+exit 1

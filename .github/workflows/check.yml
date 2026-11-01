@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: check
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (errors only)
+        run: shellcheck -S error bin/sukhi-gitops-sync scripts/*.sh test/sync-test.sh
+      - name: sync test
+        run: test/sync-test.sh

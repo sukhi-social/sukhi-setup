@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=sukhi: %i failed (see journalctl --user -u %i)
+
+[Service]
+Type=oneshot
+# 通知の先は未定(OPS_QUADLET_GITOPS.md §12-10)。いまは journal に error で残す。
+ExecStart=/usr/bin/logger -t sukhi-gitops -p user.err "%i failed; run: journalctl --user -u %i -n 50"
