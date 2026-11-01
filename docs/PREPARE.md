@@ -68,10 +68,12 @@ Cockpit は `sukhi` でログインして rootless のコンテナを見る(RUNT
 ```sh
 ssh sukhi@<箱>                        # su ではなく直接
 git clone https://github.com/sukhi-social/sukhi-setup && cd sukhi-setup
-scripts/prepare-user.sh               # 1 回目: deploy key を作って、公開鍵を表示して終わる
-# → 表示された公開鍵を sukhi-infra の Settings > Deploy keys に「読み取り専用」で登録
-scripts/prepare-user.sh --enable-timer   # 2 回目: infra を clone、podman secret、timer(--check のまま)
+scripts/prepare-user.sh --enable-timer   # infra を clone(public なので認証なしの https)、podman secret、timer(--check のまま)
 ```
+
+sukhi-infra を private に戻すときは、`INFRA_URL` を `git@github.com:sukhi-social/sukhi-infra.git` にして `prepare-user.sh` を流す。
+読み取り専用の deploy key を作って公開鍵を表示するので、sukhi-infra の Settings > Deploy keys に「読み取り専用」で登録し、もう一度流す。
+service には、`sukhi-gitops-sync.service` の注釈にある `GIT_SSH_COMMAND` の drop-in を足す。deploy key には期限がないので、年に一度は入れ替える。
 
 `podman secret`: `erlang_cookie` `secret_key_base` `anubis_ed25519_key` は自動で作る。ほかは**標準入力から**手で(値を引数やシェル履歴に残さない):
 

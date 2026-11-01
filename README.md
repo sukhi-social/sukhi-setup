@@ -17,7 +17,7 @@ sukhi の箱(Rocky Linux、Podman rootless、専用ユーザー `sukhi`)を**準
 | --- | --- |
 | `docs/PREPARE.md` | 準備の手順(上から順に) |
 | `scripts/prepare-root.sh` | root が要る部分: ユーザー、linger、cgroup 委譲、journal、`/etc/sukhi` |
-| `scripts/prepare-user.sh` | `sukhi` でやる部分: deploy key、infra の clone、`podman secret`、timer |
+| `scripts/prepare-user.sh` | `sukhi` でやる部分: infra の clone(https)、`podman secret`、timer |
 | `bin/sukhi-render` | (Ruby)`sukhi.version` の値で `{{version}}` / `{{digest:<name>}}` を埋める。**埋め方を決める唯一の場所**(箱の同期は load、sukhi-infra の CI はコマンドか load で使う) |
 | `bin/sukhi-gitops-sync` | (Ruby)引く → 署名を確かめる → 変わった unit だけ再起動 → ヘルスを待つ → 失敗なら戻す |
 | `systemd/user/` | 同期の service / timer(既定は `--check`)、失敗の通知 |
@@ -35,3 +35,8 @@ ruby test/sync_test.rb   # 16 項目。実機では何も動かさない
 `prepare-root.sh` / `prepare-user.sh` は、Ruby が入る前に動かすので bash のまま。
 
 ssh 署名の検証(gpg はテストで確認済み)と、実際の Podman・Quadlet・Cockpit は**含まれない**。箱で確かめる(docs/PREPARE.md §7)。
+
+## TODO
+
+- `prepare-root.sh` / `prepare-user.sh` を Ansible の playbook(`ansible/`)に置き換える案。pull ループ(`sukhi-gitops-sync`)は今の Ruby のまま置く。
+  Ansible と Python を箱に入れるか、手元から ssh で流すかは未定。`containers.podman` の Quadlet 対応の版も未確認。
