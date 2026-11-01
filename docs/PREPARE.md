@@ -52,9 +52,16 @@ Cockpit は `sukhi` でログインして rootless のコンテナを見る(RUNT
 <メール> namespaces="git" ssh-ed25519 AAAA...
 ```
 
-- 方式は `/etc/sukhi/gitops.env` の `VERIFY_COMMITS`(`ssh` / `gpg`)。GitHub の Web でマージして署名を付ける運用なら `gpg` にして、
-  GitHub の署名鍵(`https://github.com/web-flow.gpg`)を `sukhi` の鍵束に入れる(OPS_QUADLET_GITOPS.md §12-5。未決)。
-- 空のままだと、`ssh` 方式では**何も適用されない**(安全側)。
+- 方式は **gpg に決定**(OPS_QUADLET_GITOPS.md §12-5)。`/etc/sukhi/gitops.env` の `VERIFY_COMMITS=gpg`(既定)。
+- 検証には専用の鍵束 `GPG_HOME`(既定 `~/.local/share/sukhi-gnupg`)を使う。ここに入れた鍵の署名だけが通る。`sukhi` で:
+  ```
+  install -d -m 700 ~/.local/share/sukhi-gnupg
+  curl -fsSL https://github.com/web-flow.gpg | GNUPGHOME=~/.local/share/sukhi-gnupg gpg --import   # GitHub の Web マージ
+  GNUPGHOME=~/.local/share/sukhi-gnupg gpg --import <メンテナの公開鍵>                              # 直接 push する人
+  ```
+  取り込む前に、指紋を GitHub の画面(各人のプロフィール、web-flow は GitHub の公式文書)と見比べる。
+- 鍵束が空のままだと、**何も適用されない**(安全側)。メンテナの鍵を失効・交代したら、鍵束も入れ替える。
+- git の設定が `gpg.format=ssh` でも、同期は `gpg.format=openpgp` を指定して呼ぶので影響されない。
 
 ## 5. `sukhi` の部分
 
@@ -96,7 +103,7 @@ journalctl --user -u sukhi-gitops-sync -n 30
 
 ## 7. 実機で確かめること(未確認の一覧)
 
-- 署名の検証(`ssh` / `gpg` どちらも。`ruby test/sync_test.rb` は通さない)。
+- ssh 署名の検証(gpg はテストで確認済み。ssh は「署名なしを断る」だけ)。
 - Podman の版でのキー: `Notify=healthy`、`HealthOnFailure=kill`、`Secret=...,type=env`、ドロップインの重なり方。
 - Quadlet が `~/.config/containers/systemd/` を読み、`sukhi-gateway.service` などが生成されること(`/usr/lib/systemd/system-generators/podman-system-generator --user --dryrun`)。
 - ヘルス(`wget`)が各 image で通ること、Anubis のヘルスの口。

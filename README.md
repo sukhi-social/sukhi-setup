@@ -34,4 +34,4 @@ ruby test/sync_test.rb   # 16 項目。実機では何も動かさない
 **Ruby 3.0 以上が要る**(標準ライブラリだけ。Rocky は `sudo dnf module enable ruby:3.3 && sudo dnf install ruby`。版は `dnf module list ruby` で確かめる)。
 `prepare-root.sh` / `prepare-user.sh` は、Ruby が入る前に動かすので bash のまま。
 
-署名(ssh / gpg)の検証と、実際の Podman・Quadlet・Cockpit は**含まれない**。箱で確かめる(docs/PREPARE.md §7)。
+ssh 署名の検証(gpg はテストで確認済み)と、実際の Podman・Quadlet・Cockpit は**含まれない**。箱で確かめる(docs/PREPARE.md §7)。

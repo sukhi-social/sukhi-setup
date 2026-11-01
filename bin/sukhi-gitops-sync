@@ -52,7 +52,8 @@ module Sukhi
       @state = @cfg.call("STATE_DIR", File.join(env["XDG_STATE_HOME"] || "#{home}/.local/state", "sukhi-gitops"))
       @branch = @cfg.call("BRANCH", "main")
       # ssh = git の ssh 署名(ALLOWED_SIGNERS)、gpg = gpg の鍵束、none = 確かめない(試験用。本番では使わない)
-      @verify_commits = @cfg.call("VERIFY_COMMITS", "ssh")
+      @verify_commits = @cfg.call("VERIFY_COMMITS", "gpg")
+      @gpg_home = @cfg.call("GPG_HOME", File.join(env["XDG_DATA_HOME"] || "#{home}/.local/share", "sukhi-gnupg"))
       @allowed_signers = @cfg.call("ALLOWED_SIGNERS", "/etc/sukhi/allowed_signers")
       @verify_images = @cfg.call("VERIFY_IMAGES", "1") == "1"
       @signer_re = @cfg.call("SIGNER_RE", DEFAULT_SIGNER_RE)
@@ -191,7 +192,9 @@ module Sukhi
         ok = git("-c", "gpg.format=ssh", "-c", "gpg.ssh.allowedSignersFile=#{@allowed_signers}", "verify-commit", target).last.success?
         refuse("commit #{target} has no valid signature from #{@allowed_signers}") unless ok
       when "gpg"
-        refuse("commit #{target} has no valid gpg signature") unless git("verify-commit", target).last.success?
+        # 専用の鍵束(GPG_HOME)に入れた鍵だけを許す。鍵束に無い鍵の署名は通らない
+        out, st = Open3.capture2e({ "GNUPGHOME" => @gpg_home }, "git", "-c", "gpg.format=openpgp", "-C", @infra, "verify-commit", target)
+        refuse("commit #{target} has no valid gpg signature in #{@gpg_home}: #{out.lines.last&.strip}") unless st.success?
       when "none"
         log("WARNING: commit signatures are not checked (VERIFY_COMMITS=none)")
       else
