@@ -8,6 +8,10 @@
 
 ```sh
 sudo dnf install -y podman skopeo git openssl cockpit cockpit-podman
+# 同期スクリプトは Ruby(標準ライブラリだけ)。Rocky は module で版を選ぶ:
+dnf module list ruby                 # 3.0 以上があること
+sudo dnf module enable -y ruby:3.3 && sudo dnf install -y ruby
+ruby -v
 podman --version      # この版を OPS_QUADLET_GITOPS.md §12-6 に書く(Notify=healthy 等が効くかの根拠)
 ```
 
@@ -92,7 +96,7 @@ journalctl --user -u sukhi-gitops-sync -n 30
 
 ## 7. 実機で確かめること(未確認の一覧)
 
-- 署名の検証(`ssh` / `gpg` どちらも。`test/sync-test.sh` は通さない)。
+- 署名の検証(`ssh` / `gpg` どちらも。`ruby test/sync_test.rb` は通さない)。
 - Podman の版でのキー: `Notify=healthy`、`HealthOnFailure=kill`、`Secret=...,type=env`、ドロップインの重なり方。
 - Quadlet が `~/.config/containers/systemd/` を読み、`sukhi-gateway.service` などが生成されること(`/usr/lib/systemd/system-generators/podman-system-generator --user --dryrun`)。
 - ヘルス(`wget`)が各 image で通ること、Anubis のヘルスの口。

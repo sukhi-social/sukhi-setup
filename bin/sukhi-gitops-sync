@@ -1,225 +1,392 @@
-#!/usr/bin/env bash
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # sukhi-infra の main を引いて、署名を確かめ、変わった Quadlet の unit だけ再起動する。
 # 設計: sukhi-fedi の docs/OPS_QUADLET_GITOPS.md §3。ユーザー sukhi の user unit として動く。
 #
-#   sukhi-gitops-sync [--check]            # 既定。計画だけ。何も変えない
+#   sukhi-gitops-sync [--check]                   # 既定。計画だけ。何も変えない
 #   sukhi-gitops-sync --apply [--clear-overrides]
 #   sukhi-gitops-sync status
-#   sukhi-gitops-sync forget-rejected      # 見送った commit をもう一度対象にする
+#   sukhi-gitops-sync forget-rejected             # 見送った commit をもう一度対象にする
 #
-# 設定は /etc/sukhi/gitops.env(SUKHI_GITOPS_ENV で別の場所)。環境変数でも上書きできる。
+# 設定は環境変数 > /etc/sukhi/gitops.env(SUKHI_GITOPS_ENV で別の場所)> 既定、の順。
 # 終了コード: 0 = 最新 / 計画 / 適用した、1 = 失敗(戻した)、2 = 信頼の確認を通らず何も変えていない。
 
-set -euo pipefail
+# unit やコメントに日本語が入る。systemd の user service は LANG が無い(US-ASCII)ことがあるので UTF-8 に決める
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = nil
 
-CONF="${SUKHI_GITOPS_ENV:-/etc/sukhi/gitops.env}"
-# shellcheck disable=SC1090
-[ -f "$CONF" ] && . "$CONF"
+require "fileutils"
+require "open3"
+require "tmpdir"
+require "digest"
 
-: "${SUKHI_ENV:=$(cat /etc/sukhi/env 2>/dev/null || true)}"
-: "${INFRA_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/sukhi-infra}"
-: "${QUADLET_DIR:=${XDG_CONFIG_HOME:-$HOME/.config}/containers/systemd}"
-: "${STATE_DIR:=${XDG_STATE_HOME:-$HOME/.local/state}/sukhi-gitops}"
-: "${BRANCH:=main}"
-# ssh = git の ssh 署名(ALLOWED_SIGNERS)、gpg = gpg の鍵束(GNUPGHOME)、none = 確かめない(試験用。本番では使わない)
-: "${VERIFY_COMMITS:=ssh}"
-: "${ALLOWED_SIGNERS:=/etc/sukhi/allowed_signers}"
-: "${VERIFY_IMAGES:=1}"
-: "${SIGNER_RE:=^https://github\\.com/sukhi-social/sukhi-fedi/\\.github/workflows/(release\\.yml@refs/tags/v.+|combined-sha\\.yml@refs/heads/main)\$}"
-: "${HOLD_SECS:=30}"
-: "${NOTIFY_CMD:=}"
-# 同期スクリプトが読める sukhi.version の形式の版(manifest の requires-sync がこれより大きければ適用しない)
-: "${SYNC_API:=1}"
-: "${SUKHI_RENDER:=$(dirname "$(readlink -f "$0")")/sukhi-render}"
-# 依存の順。ここに無い unit は最後。
-: "${UNIT_ORDER:=sukhi-nats sukhi-gateway sukhi-web- sukhi-anubis}"
+# {{version}} / {{digest:*}} の埋め方は sukhi-render の一か所(ここでは再実装しない)
+load File.join(File.dirname(File.realpath(__FILE__)), "sukhi-render")
 
-mode=check; clear_overrides=0
-case "${1:-}" in
-  ""|--check) mode=check ;;
-  --apply) mode=apply ;;
-  status) mode=status ;;
-  forget-rejected) mode=forget ;;
-  *) echo "usage: $0 [--check|--apply [--clear-overrides]|status|forget-rejected]" >&2; exit 64 ;;
-esac
-shift || true
-[ "${1:-}" = "--clear-overrides" ] && clear_overrides=1
+module Sukhi
+  class Refused < StandardError; end # 信頼の確認を通らない(何も変えない)
+  class Failed < StandardError; end
 
-ZERO=$(printf '0%.0s' $(seq 64))
-SCTL=(systemctl --user)
-APPLIED="$STATE_DIR/applied"
-mkdir -p "$STATE_DIR"
+  class GitopsSync
+    # 同期スクリプトが読める sukhi.version の形式の版。manifest の requires-sync がこれより大きければ適用しない。
+    SYNC_API = 1
+    ZERO = "0" * 64
+    IMAGE_FORM = /\A[^@]+:[^@:\/]+@sha256:[0-9a-f]{64}\z/.freeze
+    DEFAULT_SIGNER_RE =
+      '^https://github\.com/sukhi-social/sukhi-fedi/\.github/workflows/' \
+      '(release\.yml@refs/tags/v.+|combined-sha\.yml@refs/heads/main)$'
 
-log()    { echo "sukhi-gitops-sync: $*"; }
-notify() { log "NOTIFY: $*"; [ -n "$NOTIFY_CMD" ] && "$NOTIFY_CMD" "$*" || true; }
-refuse() { notify "refused: $*"; exit 2; }
+    def initialize(mode:, clear_overrides:, env: ENV)
+      @mode = mode
+      @clear = clear_overrides
+      @env = env
+      conf = read_conf(env.fetch("SUKHI_GITOPS_ENV", "/etc/sukhi/gitops.env"))
+      @cfg = ->(key, default = nil) { env[key] || conf[key] || default }
+      home = Dir.home
+      @sukhi_env = (@cfg.call("SUKHI_ENV") || read_file("/etc/sukhi/env")).to_s.strip
+      @infra = @cfg.call("INFRA_DIR", File.join(env["XDG_DATA_HOME"] || "#{home}/.local/share", "sukhi-infra"))
+      @quadlet = @cfg.call("QUADLET_DIR", File.join(env["XDG_CONFIG_HOME"] || "#{home}/.config", "containers/systemd"))
+      @state = @cfg.call("STATE_DIR", File.join(env["XDG_STATE_HOME"] || "#{home}/.local/state", "sukhi-gitops"))
+      @branch = @cfg.call("BRANCH", "main")
+      # ssh = git の ssh 署名(ALLOWED_SIGNERS)、gpg = gpg の鍵束、none = 確かめない(試験用。本番では使わない)
+      @verify_commits = @cfg.call("VERIFY_COMMITS", "ssh")
+      @allowed_signers = @cfg.call("ALLOWED_SIGNERS", "/etc/sukhi/allowed_signers")
+      @verify_images = @cfg.call("VERIFY_IMAGES", "1") == "1"
+      @signer_re = @cfg.call("SIGNER_RE", DEFAULT_SIGNER_RE)
+      @hold = Integer(@cfg.call("HOLD_SECS", "30"))
+      @notify_cmd = @cfg.call("NOTIFY_CMD", "")
+      @unit_order = @cfg.call("UNIT_ORDER", "sukhi-nats sukhi-gateway sukhi-web- sukhi-anubis").split
+      @applied = File.join(@state, "applied")
+    end
 
-if [ "$mode" = status ]; then
-  echo "env:        ${SUKHI_ENV:-?}"
-  echo "last-good:  $(cat "$STATE_DIR/last-good" 2>/dev/null || echo -)"
-  echo "rejected:   $(tr '\n' ' ' <"$STATE_DIR/rejected" 2>/dev/null || true)"
-  tail -n 5 "$STATE_DIR/history" 2>/dev/null || true
-  exit 0
-fi
-if [ "$mode" = forget ]; then : >"$STATE_DIR/rejected"; log "rejected list cleared"; exit 0; fi
+    def call
+      FileUtils.mkdir_p(@state)
+      case @mode
+      when :status then return status
+      when :forget then return forget
+      end
+      refuse("SUKHI_ENV is empty (/etc/sukhi/env)") if @sukhi_env.empty?
+      refuse("no checkout at #{@infra} (run the setup's prepare-user.sh)") unless File.directory?(File.join(@infra, ".git"))
 
-[ -n "$SUKHI_ENV" ] || refuse "SUKHI_ENV is empty (/etc/sukhi/env)"
-[ -d "$INFRA_DIR/.git" ] || refuse "no checkout at $INFRA_DIR (run the setup's prepare-user.sh)"
+      File.open(File.join(@state, "lock"), File::RDWR | File::CREAT, 0o644) do |lock|
+        unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+          log("another run is in progress")
+          return 0
+        end
+        sync
+      end
+    rescue Refused => e
+      notify("refused: #{e.message}")
+      2
+    rescue Sukhi::Render::Error => e
+      notify("refused: cannot render sukhi.version into the units: #{e.message}")
+      2
+    end
 
-exec 9>"$STATE_DIR/lock"
-flock -n 9 || { log "another run is in progress"; exit 0; }
+    private
 
-git -C "$INFRA_DIR" fetch -q origin "$BRANCH"
-target=$(git -C "$INFRA_DIR" rev-parse "origin/$BRANCH")
-last=$(cat "$STATE_DIR/last-good" 2>/dev/null || true)
+    # ---- 小道具 -------------------------------------------------------------
 
-if [ "$target" = "$last" ]; then log "up to date ($target)"; exit 0; fi
-if grep -qx "$target" "$STATE_DIR/rejected" 2>/dev/null; then log "target $target was rejected before; waiting for a newer commit"; exit 0; fi
-if [ -n "$last" ] && ! git -C "$INFRA_DIR" merge-base --is-ancestor "$last" "$target"; then
-  refuse "history was rewritten ($last is not an ancestor of $target)"
-fi
+    def log(msg) = puts("sukhi-gitops-sync: #{msg}")
 
-# --- 信頼 1: コミットの署名 ---
-case "$VERIFY_COMMITS" in
-  ssh) git -C "$INFRA_DIR" -c gpg.format=ssh -c "gpg.ssh.allowedSignersFile=$ALLOWED_SIGNERS" verify-commit "$target" >/dev/null 2>&1 \
-         || refuse "commit $target has no valid signature from $ALLOWED_SIGNERS" ;;
-  gpg) git -C "$INFRA_DIR" verify-commit "$target" >/dev/null 2>&1 || refuse "commit $target has no valid gpg signature" ;;
-  none) log "WARNING: commit signatures are not checked (VERIFY_COMMITS=none)" ;;
-  *) refuse "VERIFY_COMMITS must be ssh, gpg or none" ;;
-esac
+    def notify(msg)
+      log("NOTIFY: #{msg}")
+      system(@notify_cmd, msg) unless @notify_cmd.to_s.empty?
+    end
 
-# --- 作業場所: target の base と overlays/<env> を重ねて平らにする(チェックアウトはまだ進めない) ---
-work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/tree" "$work/new"
-git -C "$INFRA_DIR" archive "$target" base "overlays/$SUKHI_ENV" | tar -x -C "$work/tree"
-[ -d "$work/tree/base" ] || refuse "no base/ in $target"
-[ -d "$work/tree/overlays/$SUKHI_ENV" ] || refuse "no overlays/$SUKHI_ENV in $target"
-cp -a "$work/tree/base/." "$work/new/"
-cp -a "$work/tree/overlays/$SUKHI_ENV/." "$work/new/"
+    def refuse(msg) = raise(Refused, msg)
 
-# --- 版の manifest: 読める形式か、{{version}} / {{digest:*}} を埋める。manifest は Quadlet のディレクトリには入れない ---
-manifest="$work/new/sukhi.version"
-[ -f "$manifest" ] || refuse "no overlays/$SUKHI_ENV/sukhi.version in $target"
-req=$(awk -F: '/^[ \t]*requires-sync[ \t]*:/ {gsub(/[ \t]/, "", $2); print $2}' "$manifest")
-case "${req:-}" in ''|*[!0-9]*) refuse "sukhi.version has no valid requires-sync" ;; esac
-[ "$req" -le "$SYNC_API" ] || refuse "sukhi.version needs sukhi-gitops-sync API $req (this one is $SYNC_API); update sukhi-setup first"
-"$SUKHI_RENDER" "$manifest" "$work/new" || refuse "cannot render sukhi.version into the units"
-rm -f "$manifest"
+    def read_file(path)
+      File.read(path)
+    rescue SystemCallError
+      ""
+    end
 
-# --- 信頼 2: 全 Image= の形と署名 ---
-images=$(grep -rh '^Image=' "$work/new" | sed 's/^Image=//' | sort -u)
-while IFS= read -r img; do
-  [ -n "$img" ] || continue
-  [[ "$img" =~ ^[^@]+:[^@:/]+@sha256:[0-9a-f]{64}$ ]] || refuse "Image= must be <name>:<tag>@sha256:<digest>: $img"
-  [[ "$img" == *"@sha256:$ZERO" ]] && refuse "placeholder digest in $target: $img"
-  if [ "$VERIFY_IMAGES" = 1 ]; then
-    case "$img" in ghcr.io/sukhi-social/*) ;; *) continue ;; esac
-    ref="${img%@*}"; ref="${ref%:*}@${img##*@}"
-    grep -qxF "$ref" "$STATE_DIR/verified" 2>/dev/null && continue
-    cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      --certificate-identity-regexp "$SIGNER_RE" "$ref" >/dev/null 2>&1 || refuse "signature check failed for $ref"
-    echo "$ref" >>"$STATE_DIR/verified"
-  fi
-done <<<"$images"
+    def read_conf(path)
+      read_file(path).each_line.with_object({}) do |line, h|
+        m = line.match(/\A\s*([A-Z][A-Z0-9_]*)=(.*?)\s*\z/)
+        next unless m
 
-# --- 手で置かれた上書き(sukhi-swap-image.sh のドロップインなど)の検出 ---
-drift=0
-if [ -d "$APPLIED" ]; then
-  diff -rq "$APPLIED" "$QUADLET_DIR" >/dev/null 2>&1 || drift=1
-elif [ -d "$QUADLET_DIR" ] && [ -n "$(ls -A "$QUADLET_DIR" 2>/dev/null)" ]; then
-  drift=1
-fi
-if [ "$drift" = 1 ] && [ "$clear_overrides" = 0 ]; then
-  [ "$mode" = apply ] && refuse "$QUADLET_DIR differs from what was last applied (manual overrides?). Review, then run with --apply --clear-overrides"
-  log "WARNING: $QUADLET_DIR differs from what was last applied; --apply needs --clear-overrides"
-fi
+        h[m[1]] = m[2].sub(/\A(["'])(.*)\1\z/, '\2')
+      end
+    end
 
-# --- どの unit が変わるか(重ねたあとの差で見る。別の環境の変更では動かない) ---
-base_cmp="$APPLIED"; [ -d "$base_cmp" ] || base_cmp="$work/empty"; mkdir -p "$work/empty"
-[ "$drift" = 1 ] && [ "$clear_overrides" = 1 ] && [ -d "$QUADLET_DIR" ] && base_cmp="$QUADLET_DIR"
-filelist() { (cd "$1" && find . -type f | sed 's#^\./##' | sort); }
-changed=(); removed=(); added=()
-while IFS= read -r f; do
-  if [ ! -f "$base_cmp/$f" ]; then changed+=("$f"); added+=("$f")
-  elif ! cmp -s "$base_cmp/$f" "$work/new/$f"; then changed+=("$f"); fi
-done < <(filelist "$work/new")
-while IFS= read -r f; do [ -f "$work/new/$f" ] || removed+=("$f"); done < <([ -d "$base_cmp" ] && filelist "$base_cmp" || true)
+    def state_file(name) = File.join(@state, name)
 
-# ファイル → unit 名(.container と .container.d/ は <name>.service)。.network / .volume は使う unit を足す。
-declare -A units=()
-unit_of() { local f=$1 n; n=${f%%/*}; n=${n%.container.d}; n=${n%.container}; echo "$n"; }
-for f in "${changed[@]}"; do
-  case "$f" in
-    *.container|*.container.d/*) units["$(unit_of "$f")"]=1 ;;
-    *.network|*.volume)
-      res=${f##*/}
-      for c in "$work"/new/*.container; do grep -qF "$res" "$c" && units["$(basename "$c" .container)"]=1; done ;;
-  esac
-done
-newunits=(); for f in "${added[@]}"; do case "$f" in *.container) newunits+=("$(unit_of "$f")") ;; esac; done
-gone=()
-for f in "${removed[@]}"; do case "$f" in *.container) gone+=("$(unit_of "$f")") ;; esac; done
+    def read_state(name) = read_file(state_file(name)).strip
 
-ordered=()
-for pat in $UNIT_ORDER; do for u in "${!units[@]}"; do case "$u" in "$pat"*) ordered+=("$u"); unset 'units[$u]' ;; esac; done; done
-for u in "${!units[@]}"; do ordered+=("$u"); done
+    def git(*args) = Open3.capture2e("git", "-C", @infra, *args)
 
-log "target ${target:0:12} (last-good ${last:0:12}), env=$SUKHI_ENV"
-log "restart: ${ordered[*]:-(none)}"; log "stop (removed): ${gone[*]:-(none)}"
+    def git!(*args)
+      out, st = git(*args)
+      raise Failed, "git #{args.first} failed: #{out}" unless st.success?
 
-if [ "$mode" = check ]; then log "check only; nothing changed. run with --apply"; exit 0; fi
+      out.strip
+    end
 
-# --- 適用 ---
-swap_in() {   # $1 = 入れるディレクトリ
-  rm -rf "$QUADLET_DIR.next"; mkdir -p "$(dirname "$QUADLET_DIR")"
-  cp -a "$1" "$QUADLET_DIR.next"
-  rm -rf "$QUADLET_DIR.prev"; [ -e "$QUADLET_DIR" ] && mv "$QUADLET_DIR" "$QUADLET_DIR.prev"
-  mv "$QUADLET_DIR.next" "$QUADLET_DIR"
-}
-healthy() {
-  local u=$1 st
-  "${SCTL[@]}" is-active --quiet "$u.service" || return 1
-  st=$(podman inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$u" 2>/dev/null || true)
-  [ -z "$st" ] || [ "$st" = healthy ]
-}
-is_new() { local x; for x in "${newunits[@]}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
-restart_set() {   # 引数: unit 名。動いていれば再起動(try-restart)、新しい unit は起こす(restart)。
-  local u
-  for u in "$@"; do
-    if is_new "$u"; then "${SCTL[@]}" restart "$u.service" || return 1
-    else "${SCTL[@]}" try-restart "$u.service" || return 1; fi
-  done
-}
+    def sctl(*args) = system("systemctl", "--user", *args)
 
-for u in "${gone[@]}"; do "${SCTL[@]}" stop "$u.service" || true; done
-swap_in "$work/new"
-if ! { "${SCTL[@]}" daemon-reload && restart_set "${ordered[@]}"; }; then ok=0; else
-  ok=1; sleep "$HOLD_SECS"
-  for u in "${ordered[@]}"; do healthy "$u" || { ok=0; log "unit $u is not healthy"; }; done
-fi
+    # ---- status / forget ----------------------------------------------------
 
-if [ "$ok" = 1 ]; then
-  rm -rf "$APPLIED"; cp -a "$work/new" "$APPLIED"
-  git -C "$INFRA_DIR" reset -q --hard "$target"
-  echo "$target" >"$STATE_DIR/last-good"
-  printf '%s %s env=%s units=%s\n' "$(date -u +%FT%TZ)" "$target" "$SUKHI_ENV" "${ordered[*]:-}" >>"$STATE_DIR/history"
-  notify "sync ok ${target:0:12} (${ordered[*]:-no units changed})"
-  exit 0
-fi
+    def status
+      puts "env:        #{@sukhi_env.empty? ? '?' : @sukhi_env}"
+      puts "last-good:  #{read_state('last-good').then { |s| s.empty? ? '-' : s }}"
+      puts "rejected:   #{read_state('rejected').split.join(' ')}"
+      puts read_file(state_file("history")).lines.last(5).join
+      0
+    end
 
-# --- 失敗: 見送りに記録して、前の状態に戻す(チェックアウトは進めていない) ---
-echo "$target" >>"$STATE_DIR/rejected"
-if [ -d "$APPLIED" ]; then
-  swap_in "$APPLIED"
-  "${SCTL[@]}" daemon-reload || true
-  rb=0
-  for u in "${newunits[@]}"; do "${SCTL[@]}" stop "$u.service" || true; done
-  for u in "${ordered[@]}"; do is_new "$u" && continue; "${SCTL[@]}" try-restart "$u.service" || rb=1; done
-  if [ "$rb" = 1 ]; then notify "sync rejected ${target:0:12} and ROLLBACK FAILED; manual action needed"; exit 1; fi
-  notify "sync rejected ${target:0:12}: unhealthy; rolled back to ${last:0:12}"
-else
-  notify "sync rejected ${target:0:12}: unhealthy; nothing to roll back to (first apply)"
-fi
-exit 1
+    def forget
+      File.write(state_file("rejected"), "")
+      log("rejected list cleared")
+      0
+    end
+
+    # ---- 本体 ---------------------------------------------------------------
+
+    def sync
+      out, st = git("fetch", "-q", "origin", @branch)
+      raise Failed, "git fetch failed: #{out}" unless st.success?
+
+      target = git!("rev-parse", "origin/#{@branch}")
+      last = read_state("last-good")
+
+      if target == last
+        log("up to date (#{target})")
+        return 0
+      end
+      if read_state("rejected").split.include?(target)
+        log("target #{target} was rejected before; waiting for a newer commit")
+        return 0
+      end
+      if !last.empty? && !git("merge-base", "--is-ancestor", last, target).last.success?
+        refuse("history was rewritten (#{last} is not an ancestor of #{target})")
+      end
+
+      verify_commit(target)
+
+      Dir.mktmpdir("sukhi-sync") do |work|
+        new_dir = build_tree(work, target)
+        verify_images(new_dir)
+        plan = make_plan(work, new_dir)
+
+        log("target #{target[0, 12]} (last-good #{last[0, 12]}), env=#{@sukhi_env}")
+        log("restart: #{plan[:restart].empty? ? '(none)' : plan[:restart].join(' ')}")
+        log("stop (removed): #{plan[:gone].empty? ? '(none)' : plan[:gone].join(' ')}")
+        if @mode == :check
+          log("check only; nothing changed. run with --apply")
+          return 0
+        end
+        apply(new_dir, plan, target, last)
+      end
+    end
+
+    # --- 信頼 1: コミットの署名 ---
+    def verify_commit(target)
+      case @verify_commits
+      when "ssh"
+        ok = git("-c", "gpg.format=ssh", "-c", "gpg.ssh.allowedSignersFile=#{@allowed_signers}", "verify-commit", target).last.success?
+        refuse("commit #{target} has no valid signature from #{@allowed_signers}") unless ok
+      when "gpg"
+        refuse("commit #{target} has no valid gpg signature") unless git("verify-commit", target).last.success?
+      when "none"
+        log("WARNING: commit signatures are not checked (VERIFY_COMMITS=none)")
+      else
+        refuse("VERIFY_COMMITS must be ssh, gpg or none")
+      end
+    end
+
+    # target の base と overlays/<env> を重ねて平らにし、sukhi.version で埋める(チェックアウトはまだ進めない)
+    def build_tree(work, target)
+      tree = File.join(work, "tree")
+      new_dir = File.join(work, "new")
+      FileUtils.mkdir_p([tree, new_dir])
+      archive, st = Open3.capture2("git", "-C", @infra, "archive", target, "base", "overlays/#{@sukhi_env}", binmode: true)
+      refuse("cannot read base/ and overlays/#{@sukhi_env} from #{target}") unless st.success?
+      IO.popen(["tar", "-x", "-C", tree], "wb") { |io| io.write(archive) }
+      refuse("no base/ in #{target}") unless File.directory?(File.join(tree, "base"))
+      overlay = File.join(tree, "overlays", @sukhi_env)
+      refuse("no overlays/#{@sukhi_env} in #{target}") unless File.directory?(overlay)
+      FileUtils.cp_r(File.join(tree, "base", "."), new_dir)
+      FileUtils.cp_r(File.join(overlay, "."), new_dir)
+
+      manifest_path = File.join(new_dir, "sukhi.version")
+      refuse("no overlays/#{@sukhi_env}/sukhi.version in #{target}") unless File.file?(manifest_path)
+      manifest = Sukhi::Render.parse_manifest(manifest_path)
+      req = manifest["requires-sync"].to_s
+      refuse("sukhi.version has no valid requires-sync") unless req.match?(/\A\d+\z/)
+      if req.to_i > SYNC_API
+        refuse("sukhi.version needs sukhi-gitops-sync API #{req} (this one is #{SYNC_API}); update sukhi-setup first")
+      end
+      Sukhi::Render.render_dir(manifest_path, new_dir)
+      File.delete(manifest_path) # Quadlet のディレクトリには入れない
+      new_dir
+    end
+
+    # --- 信頼 2: 全 Image= の形と署名 ---
+    def verify_images(new_dir)
+      images = Dir.glob(File.join(new_dir, "**", "*")).select { |f| File.file?(f) }
+                  .flat_map { |f| File.readlines(f, chomp: true).grep(/\AImage=/).map { |l| l.sub("Image=", "") } }.uniq
+      verified = read_file(state_file("verified")).split("\n")
+      images.each do |img|
+        refuse("Image= must be <name>:<tag>@sha256:<digest>: #{img}") unless img.match?(IMAGE_FORM)
+        refuse("placeholder digest in #{img}") if img.end_with?("@sha256:#{ZERO}")
+        next unless @verify_images && img.start_with?("ghcr.io/sukhi-social/")
+
+        ref = "#{img.split('@').first.sub(/:[^:\/]+\z/, '')}@#{img.split('@').last}"
+        next if verified.include?(ref)
+
+        _, st = Open3.capture2e("cosign", "verify", "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
+                                "--certificate-identity-regexp", @signer_re, ref)
+        refuse("signature check failed for #{ref}") unless st.success?
+        File.open(state_file("verified"), "a") { |f| f.puts(ref) }
+      end
+    end
+
+    def tree_files(dir)
+      return {} unless File.directory?(dir)
+
+      Dir.glob(File.join(dir, "**", "*"), File::FNM_DOTMATCH).select { |f| File.file?(f) }
+         .to_h { |f| [f.delete_prefix("#{dir}/"), Digest::SHA256.file(f).hexdigest] }
+    end
+
+    def unit_of(file) = file.split("/").first.sub(/\.container(\.d)?\z/, "")
+
+    def make_plan(work, new_dir)
+      # 手で置かれた上書き(sukhi-swap-image.sh のドロップインなど)の検出
+      installed = tree_files(@quadlet)
+      applied = tree_files(@applied)
+      drift = File.directory?(@applied) ? applied != installed : !installed.empty?
+      if drift && !@clear
+        refuse("#{@quadlet} differs from what was last applied (manual overrides?). Review, then run with --apply --clear-overrides") if @mode == :apply
+
+        log("WARNING: #{@quadlet} differs from what was last applied; --apply needs --clear-overrides")
+      end
+      old = drift && @clear ? installed : applied
+
+      # 重ねて埋めたあとの差で見る(別の環境の変更では動かない)
+      cur = tree_files(new_dir)
+      changed = cur.select { |f, h| old[f] != h }.keys
+      removed = (old.keys - cur.keys)
+      added = cur.keys - old.keys
+
+      units = {}
+      changed.each do |f|
+        if f.match?(/\.container(\.d\/.*)?\z/)
+          units[unit_of(f)] = true
+        elsif f.match?(/\.(network|volume)\z/)
+          Dir.glob(File.join(new_dir, "*.container")).each do |c|
+            units[File.basename(c, ".container")] = true if File.read(c).include?(File.basename(f))
+          end
+        end
+      end
+
+      ordered = []
+      @unit_order.each do |pat|
+        units.keys.sort.each { |u| ordered << u if u.start_with?(pat) && !ordered.include?(u) }
+      end
+      ordered.concat((units.keys - ordered).sort)
+
+      {
+        restart: ordered,
+        new: added.select { |f| f.end_with?(".container") }.map { |f| unit_of(f) },
+        gone: removed.select { |f| f.end_with?(".container") }.map { |f| unit_of(f) },
+      }
+    end
+
+    # ---- 適用 ---------------------------------------------------------------
+
+    def swap_in(dir)
+      FileUtils.rm_rf("#{@quadlet}.next")
+      FileUtils.mkdir_p(File.dirname(@quadlet))
+      FileUtils.cp_r(dir, "#{@quadlet}.next")
+      FileUtils.rm_rf("#{@quadlet}.prev")
+      File.rename(@quadlet, "#{@quadlet}.prev") if File.exist?(@quadlet)
+      File.rename("#{@quadlet}.next", @quadlet)
+    end
+
+    def healthy?(unit)
+      return false unless system("systemctl", "--user", "is-active", "--quiet", "#{unit}.service")
+
+      out, = Open3.capture2e("podman", "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{end}}", unit)
+      status = out.strip
+      status.empty? || status == "healthy"
+    end
+
+    # 動いていれば再起動(try-restart)、新しい unit は起こす(restart)
+    def restart_set(plan)
+      plan[:restart].all? do |u|
+        plan[:new].include?(u) ? sctl("restart", "#{u}.service") : sctl("try-restart", "#{u}.service")
+      end
+    end
+
+    def apply(new_dir, plan, target, last)
+      plan[:gone].each { |u| sctl("stop", "#{u}.service") }
+      swap_in(new_dir)
+      ok = sctl("daemon-reload") && restart_set(plan)
+      if ok
+        sleep(@hold)
+        plan[:restart].each do |u|
+          next if healthy?(u)
+
+          ok = false
+          log("unit #{u} is not healthy")
+        end
+      end
+
+      if ok
+        FileUtils.rm_rf(@applied)
+        FileUtils.cp_r(new_dir, @applied)
+        git!("reset", "-q", "--hard", target)
+        File.write(state_file("last-good"), "#{target}\n")
+        File.open(state_file("history"), "a") do |f|
+          f.puts("#{Time.now.utc.strftime('%FT%TZ')} #{target} env=#{@sukhi_env} units=#{plan[:restart].join(' ')}")
+        end
+        notify("sync ok #{target[0, 12]} (#{plan[:restart].empty? ? 'no units changed' : plan[:restart].join(' ')})")
+        return 0
+      end
+
+      # 失敗: 見送りに記録して、前の状態に戻す(チェックアウトは進めていない)
+      File.open(state_file("rejected"), "a") { |f| f.puts(target) }
+      if File.directory?(@applied)
+        swap_in(@applied)
+        sctl("daemon-reload")
+        plan[:new].each { |u| sctl("stop", "#{u}.service") }
+        rolled = plan[:restart].reject { |u| plan[:new].include?(u) }.map { |u| sctl("try-restart", "#{u}.service") }.all?
+        if rolled
+          notify("sync rejected #{target[0, 12]}: unhealthy; rolled back to #{last[0, 12]}")
+        else
+          notify("sync rejected #{target[0, 12]} and ROLLBACK FAILED; manual action needed")
+        end
+      else
+        notify("sync rejected #{target[0, 12]}: unhealthy; nothing to roll back to (first apply)")
+      end
+      1
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  mode = :check
+  clear = false
+  args = ARGV.dup
+  case args.shift
+  when nil, "--check" then mode = :check
+  when "--apply" then mode = :apply
+  when "status" then mode = :status
+  when "forget-rejected" then mode = :forget
+  else
+    warn "usage: #{File.basename($PROGRAM_NAME)} [--check|--apply [--clear-overrides]|status|forget-rejected]"
+    exit 64
+  end
+  clear = true if args.first == "--clear-overrides"
+  begin
+    exit Sukhi::GitopsSync.new(mode: mode, clear_overrides: clear).call
+  rescue Sukhi::Failed => e
+    warn "sukhi-gitops-sync: #{e.message}"
+    exit 1
+  end
+end
