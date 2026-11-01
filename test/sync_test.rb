@@ -232,6 +232,16 @@ class SyncTest < Minitest::Test
     refute File.exist?(@quadlet)
   end
 
+  def test_unwritable_quadlet_dir_stops_nothing
+    # 置き場所の親がファイル(= mkdir できない)。unit を止める前に失敗して、何も止めない
+    parent = File.join(@tmp, "blocked")
+    File.write(parent, "")
+    @env["QUADLET_DIR"] = File.join(parent, "systemd")
+    assert_equal 1, run_sync("--apply")
+    assert_match(/cannot write/, @last_out)
+    assert_empty calls
+  end
+
   # --- gpg: 専用の鍵束に入れた鍵の署名だけを許す(実際の gpg を使う) ---
   def gpg_key(name)
     home = File.join(@tmp, "gpg-#{name}")
