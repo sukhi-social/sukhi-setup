@@ -172,6 +172,7 @@ module Sukhi
       Dir.mktmpdir("sukhi-sync") do |work|
         new_dir = build_tree(work, target)
         verify_images(new_dir)
+        preflight(new_dir)
         plan = make_plan(work, new_dir)
 
         log("target #{target[0, 12]} (last-good #{last[0, 12]}), env=#{@sukhi_env}")
@@ -247,6 +248,29 @@ module Sukhi
         refuse("signature check failed for #{ref}") unless st.success?
         File.open(state_file("verified"), "a") { |f| f.puts(ref) }
       end
+    end
+
+    def preflight(new_dir)
+      return if @cfg.call("PREFLIGHT", "1") == "0"
+
+      config = @cfg.call("SUKHI_INSTANCE_CONFIG", "/etc/sukhi/instance.json")
+      refuse("missing instance config #{config}; create it as root before applying Quadlet") unless File.file?(config)
+      refuse("instance config #{config} is empty") if File.zero?(config)
+
+      files = Dir.glob(File.join(new_dir, "**", "*")).select { |f| File.file?(f) }
+      placeholders = files.flat_map do |file|
+        File.readlines(file, chomp: true).grep(/(?:DOMAIN|HOST|ORIGIN|UPSTREAM)=/i).select do |line|
+          line.match?(/(?:change[-_ ]?me|(?:example|[[:alnum:]_-]+)\.invalid|example\.com|your[-_ ]?domain|<domain>)/i)
+        end.map { |line| "#{file}: #{line}" }
+      end
+      refuse("placeholder DOMAIN/config value: #{placeholders.first}") unless placeholders.empty?
+
+      upstreams = files.flat_map do |file|
+        File.readlines(file, chomp: true).filter_map do |line|
+          line[/\b(?:UPSTREAM|FRONTEND_UPSTREAM)=([^[:space:]]+)/i, 1]
+        end
+      end.uniq
+      refuse("frontend/upstream values disagree: #{upstreams.join(', ')}") if upstreams.length > 1
     end
 
     def tree_files(dir)

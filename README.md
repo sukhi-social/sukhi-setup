@@ -18,6 +18,7 @@ sukhi の箱(Rocky Linux、Podman rootless、専用ユーザー `sukhi`)を**準
 | `docs/PREPARE.md` | 準備の手順(上から順に) |
 | `scripts/prepare-root.sh` | root が要る部分: ユーザー、linger、cgroup 委譲、journal、`/etc/sukhi` |
 | `scripts/prepare-user.sh` | `sukhi` でやる部分: infra の clone(https)、`podman secret`、timer |
+| `scripts/sukhi-preflight.sh` | `sukhi` で適用前に instance config、release、rootless Podman、placeholder を検査 |
 | `bin/sukhi-render` | (Ruby)`sukhi.version` の値で `{{version}}` / `{{digest:<name>}}` を埋める。**埋め方を決める唯一の場所**(箱の同期は load、sukhi-infra の CI はコマンドか load で使う) |
 | `bin/sukhi-gitops-sync` | (Ruby)引く → 署名を確かめる → 変わった unit だけ再起動 → ヘルスを待つ → 失敗なら戻す |
 | `systemd/user/` | 同期の service / timer(既定は `--check`)、失敗の通知 |
