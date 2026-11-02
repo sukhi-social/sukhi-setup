@@ -26,6 +26,9 @@ sudo scripts/prepare-root.sh prod        # 開発の箱なら dev
 
 やること: `sukhi` ユーザー、linger、cgroup 委譲(`Delegate=cpu cpuset io memory pids`)、journal の永続化、`/etc/sukhi/`。
 
+既存の `sukhi` ユーザーは作り直さず、home と subuid/subgid を検査して再利用する。既存の
+`/etc/sukhi/env`、`gitops.env`、`allowed_signers`、secret、volume は上書きしない。
+
 確かめ:
 
 ```sh
@@ -75,6 +78,19 @@ sukhi-infra を private に戻すときは、`INFRA_URL` を `git@github.com:suk
 読み取り専用の deploy key を作って公開鍵を表示するので、sukhi-infra の Settings > Deploy keys に「読み取り専用」で登録し、もう一度流す。
 service には、`sukhi-gitops-sync.service` の注釈にある `GIT_SSH_COMMAND` の drop-in を足す。deploy key には期限がないので、年に一度は入れ替える。
 
+`prepare-user.sh` は既存 checkout の変更を守るため、dirty な checkout を上書きせず停止する。既定では `origin/main` の
+commit を detached checkout にし、固定したい release は `--release REV` で指定できる。その後 root で次を実行する:
+
+```sh
+sudo scripts/prepare-root.sh prod \
+  --infra-dir /home/sukhi/.local/share/sukhi-infra \
+  --release <commit>
+```
+
+infra が `stow/sukhi/` を提供する場合、root スクリプトは GNU Stow の dry-run と本適用を順に行い、
+`/etc/sukhi` の非秘密設定と Quadlet の入口だけを symlink で接続する。既存の `/etc/sukhi/infra` が
+別 checkout を指している場合は安全のため停止する。秘密は Stow に置かず、`podman secret` のままにする。
+
 `podman secret`: `erlang_cookie` `secret_key_base` `anubis_ed25519_key` は自動で作る。ほかは**標準入力から**手で(値を引数やシェル履歴に残さない):
 
 ```sh
@@ -99,6 +115,9 @@ journalctl --user -u sukhi-gitops-sync -n 30
 - 版は sukhi-infra の `overlays/<env>/sukhi.version` に書かれ、同期スクリプトが unit の `{{version}}` / `{{digest:*}}` に埋める。
   `requires-sync` がこの スクリプトの版より大きいと適用しない(先に sukhi-setup を更新する)。
 - **仮のダイジェスト(0 埋め)は適用されない。** 最初の bump PR(4 つの image が同じ sha で本物になる)がマージされてから先へ。
+- 適用前に `scripts/sukhi-preflight.sh` を `sukhi` で実行する。`/etc/sukhi/instance.json`
+  (または `SUKHI_INSTANCE_CONFIG`) の存在・JSON、infra checkout の clean 状態、rootless Podman、
+  placeholder DOMAIN を検査する。同期スクリプト自身も同じ契約を検査する。
 - 適用に進む: `systemctl --user edit sukhi-gitops-sync.service` で `[Service]` に `Environment=SUKHI_GITOPS_MODE=--apply`。
 - 最初の適用の前に、`~/.config/containers/systemd/` に手で置いたものがあれば `--apply --clear-overrides` が要る(手で置いたものは消える)。
 - **わざと壊した PR**(存在しないダイジェスト、起動しない設定)で、戻しと見送り(`sukhi-gitops-sync status` の `rejected`)を試してから、本番に任せる。
@@ -112,3 +131,4 @@ journalctl --user -u sukhi-gitops-sync -n 30
 - cgroup の委譲で `cpu` が見えること、`CPUWeight=` が効くこと。
 - Cockpit に `sukhi` で入って、コンテナと user の unit が見えること。
 - 非常時: `sukhi-fedi/scripts/sukhi-swap-image.sh` はドロップインを置く。次の同期で `--clear-overrides` が要る(意図した動き)。
+- 失敗時は表示された `next:` をそのまま確認する。root のコマンドと `sukhi` のコマンドを混ぜず、secret/volume を消す再初期化はしない。

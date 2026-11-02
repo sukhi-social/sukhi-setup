@@ -127,6 +127,7 @@ class SyncTest < Minitest::Test
       "PATH" => "#{@bin}:#{ENV['PATH']}", "FAKE_LOG" => @log, "HOME" => File.join(@tmp, "home"),
       "SUKHI_GITOPS_ENV" => "/dev/null", "SUKHI_ENV" => "test", "INFRA_DIR" => File.join(@tmp, "infra"),
       "QUADLET_DIR" => @quadlet, "STATE_DIR" => @state, "VERIFY_COMMITS" => "none", "HOLD_SECS" => "0",
+      "PREFLIGHT" => "0",
     }
   end
 
@@ -194,6 +195,16 @@ class SyncTest < Minitest::Test
     manifest("test", "sha-ccccccc", ZERO, D2)
     commit("c6")
     assert_equal 2, run_sync("--apply")
+    assert_empty calls
+  end
+
+  def test_preflight_rejects_placeholder_domain
+    @env["PREFLIGHT"] = "1"
+    config = File.join(@tmp, "instance.json")
+    File.write(config, "{}")
+    @env["SUKHI_INSTANCE_CONFIG"] = config
+    assert_equal 2, run_sync("--apply")
+    assert_includes @last_out, "placeholder DOMAIN/config value"
     assert_empty calls
   end
 
