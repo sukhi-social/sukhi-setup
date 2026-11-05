@@ -86,6 +86,16 @@ else
   echo "note: no $infra_dir/stow/sukhi package; non-secret Stow entrypoint not installed yet"
 fi
 
+# instance.json: 無ければ infra の overlays/<env>/instance.json を写す(既存は上書きしない。stow が置いたものも守る)
+if [ ! -e /etc/sukhi/instance.json ]; then
+  if [ -f "$infra_dir/overlays/$env_name/instance.json" ]; then
+    install -m 644 "$infra_dir/overlays/$env_name/instance.json" /etc/sukhi/instance.json
+    echo "note: /etc/sukhi/instance.json を overlays/$env_name/instance.json から作った"
+  else
+    echo "note: /etc/sukhi/instance.json が無い。$infra_dir/overlays/$env_name/instance.json を見つけたら、もう一度流す" >&2
+  fi
+fi
+
 echo "ok. 次: (1) sukhi のパスワードをパスワードマネージャーで作って passwd sukhi (Cockpit のログインに必須)"
 echo "    (2) /etc/sukhi/allowed_signers に署名者の公開鍵を (3) sukhi で prepare-user.sh"
 echo "    失敗時は表示された『次』を実行。既存 secret/volume は変更しない。"
