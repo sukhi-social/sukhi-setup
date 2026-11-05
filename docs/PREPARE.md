@@ -123,6 +123,23 @@ journalctl --user -u sukhi-gitops-sync -n 30
 - 最初の適用の前に、`~/.config/containers/systemd/` に手で置いたものがあれば `--apply --clear-overrides` が要る(手で置いたものは消える)。
 - **わざと壊した PR**(存在しないダイジェスト、起動しない設定)で、戻しと見送り(`sukhi-gitops-sync status` の `rejected`)を試してから、本番に任せる。
 
+### 状態のファイル(`status.json`)
+
+`--check` と `--apply` は、終わるたびに `~/.local/state/sukhi-gitops/public/status.json`(0644、書き込みは一時ファイルから rename)を書く。
+管理画面などが、読むだけでよい形にしてある。
+
+```json
+{ "schema": 1, "env": "dev", "checked_at": "2026-11-05T03:30:00Z",
+  "state": "update_available",
+  "applied":   { "commit": "…", "version": "sha-a81329d", "at": "…" },
+  "available": { "commit": "…", "version": "sha-bbbbbbb", "verified": true },
+  "rejected": [], "last_error": null }
+```
+
+- `state` は `up_to_date` / `update_available` / `rejected`(適用に失敗して見送り中) / `error`(取得や検証で止まった)。
+- `available` は、署名と image の検証が通った版だけ。`error` のときは `null`。`applied` は動いている版で、`error` でも残る。
+- `last_error` は 300 文字まで。秘密は入れていない。
+
 ## 7. 実機で確かめること(未確認の一覧)
 
 - ssh 署名の検証(gpg はテストで確認済み。ssh は「署名なしを断る」だけ)。
