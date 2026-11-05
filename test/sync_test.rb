@@ -12,6 +12,7 @@ Encoding.default_external = Encoding::UTF_8
 Encoding.default_internal = nil
 
 require "fileutils"
+require "json"
 require "minitest/autorun"
 require "open3"
 require "tmpdir"
@@ -188,6 +189,71 @@ class SyncTest < Minitest::Test
     assert_includes File.read(File.join(@state, "rejected")), sh("git", "rev-parse", "origin/main", dir: File.join(@tmp, "infra")).strip
     assert_equal 0, run_sync("--apply")
     assert_empty calls
+  end
+
+  def status_json = JSON.parse(File.read(File.join(@state, "public", "status.json")))
+
+  def test_status_json_reports_available_update_on_check
+    assert_equal 0, run_sync("--check")
+    st = status_json
+    assert_equal 1, st["schema"]
+    assert_equal "update_available", st["state"]
+    assert_equal "test", st["env"]
+    assert_equal "sha-aaaaaaa", st["available"]["version"]
+    assert_equal true, st["available"]["verified"]
+    assert_match(/\A\h{40}\z/, st["available"]["commit"])
+    assert_nil st["applied"]
+    assert_match(/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\z/, st["checked_at"])
+    assert_empty Dir.glob(File.join(@state, "public", ".status.json.*"))
+  end
+
+  def test_status_json_after_apply_and_when_up_to_date
+    assert_equal 0, run_sync("--apply")
+    st = status_json
+    assert_equal "up_to_date", st["state"]
+    assert_nil st["available"]
+    assert_equal File.read(File.join(@state, "last-good")).strip, st["applied"]["commit"]
+    assert_equal "sha-aaaaaaa", st["applied"]["version"]
+    applied = st["applied"]
+    assert_equal 0, run_sync("--apply") # 変更なし。applied の version と時刻は引き継ぐ
+    assert_equal "up_to_date", status_json["state"]
+    assert_equal applied, status_json["applied"]
+  end
+
+  def test_status_json_reports_rejected_and_keeps_applied
+    run_sync("--apply")
+    applied = status_json["applied"]
+    manifest("test", "sha-bbbbbbb", D2, D2)
+    commit("c-rej")
+    assert_equal 1, run_sync("--apply", unhealthy: "sukhi-web-next")
+    st = status_json
+    assert_equal "rejected", st["state"]
+    assert_equal "sha-bbbbbbb", st["available"]["version"]
+    assert_equal applied, st["applied"]
+    assert_equal [st["available"]["commit"]], st["rejected"]
+    assert_equal 0, run_sync("--check") # 見送り中の版は、待つだけ
+    assert_equal "rejected", status_json["state"]
+  end
+
+  def test_status_json_reports_error_when_refused
+    run_sync("--apply")
+    manifest("test", "sha-ccccccc", ZERO, D2)
+    commit("c-ref")
+    assert_equal 2, run_sync("--apply")
+    st = status_json
+    assert_equal "error", st["state"]
+    assert_match(/placeholder digest/, st["last_error"])
+    assert_nil st["available"]
+  end
+
+  def test_status_json_reports_error_when_fetch_fails
+    run_sync("--apply")
+    FileUtils.rm_rf(File.join(@tmp, "origin.git"))
+    assert_equal 1, run_sync("--check")
+    st = status_json
+    assert_equal "error", st["state"]
+    assert_match(/git fetch failed/, st["last_error"])
+    refute_nil st["applied"] # 動いている版は分かる
   end
 
   def test_placeholder_digest_is_refused

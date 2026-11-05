@@ -22,6 +22,8 @@ require "fileutils"
 require "open3"
 require "tmpdir"
 require "digest"
+require "json"
+require "time"
 
 # {{version}} / {{digest:*}} の埋め方は sukhi-render の一か所(ここでは再実装しない)
 load File.join(File.dirname(File.realpath(__FILE__)), "sukhi-render")
@@ -61,6 +63,9 @@ module Sukhi
       @notify_cmd = @cfg.call("NOTIFY_CMD", "")
       @unit_order = @cfg.call("UNIT_ORDER", "sukhi-nats sukhi-gateway sukhi-web- sukhi-anubis").split
       @applied = File.join(@state, "applied")
+      @public = File.join(@state, "public") # 管理画面(gateway)が読み取り専用で読む。秘密は置かない
+      @status = nil
+      @target_version = nil
     end
 
     def call
@@ -81,10 +86,18 @@ module Sukhi
       end
     rescue Refused => e
       notify("refused: #{e.message}")
+      @status = { state: "error", last_error: e.message }
       2
     rescue Sukhi::Render::Error => e
       notify("refused: cannot render sukhi.version into the units: #{e.message}")
+      @status = { state: "error", last_error: "cannot render sukhi.version: #{e.message}" }
       2
+    rescue Failed => e
+      notify("failed: #{e.message}")
+      @status = { state: "error", last_error: e.message }
+      1
+    ensure
+      write_status
     end
 
     private
@@ -130,6 +143,36 @@ module Sukhi
 
     def sctl(*args) = system("systemctl", "--user", *args)
 
+    # ---- status.json(管理画面に見せる状態。check / apply のたびに原子的に書く) ----
+
+    def write_status
+      return unless @status && %i[check apply].include?(@mode)
+
+      last = read_state("last-good")
+      prev = begin
+        JSON.parse(read_file(File.join(@public, "status.json")))
+      rescue JSON::ParserError
+        {}
+      end
+      applied = @status[:applied] ||
+                (prev["applied"] if prev.dig("applied", "commit") == last && !last.empty?) ||
+                (last.empty? ? nil : { "commit" => last, "version" => nil, "at" => nil })
+      doc = {
+        schema: 1, env: @sukhi_env, checked_at: Time.now.utc.iso8601,
+        applied: applied, available: @status[:available], state: @status[:state],
+        rejected: read_state("rejected").split, last_error: @status[:last_error]&.to_s&.slice(0, 300)
+      }
+      FileUtils.mkdir_p(@public)
+      tmp = File.join(@public, ".status.json.#{Process.pid}")
+      File.write(tmp, "#{JSON.pretty_generate(doc)}\n")
+      File.chmod(0o644, tmp)
+      File.rename(tmp, File.join(@public, "status.json"))
+    rescue SystemCallError => e
+      log("cannot write status.json: #{e.message}")
+    end
+
+    def available(target) = { commit: target, version: @target_version, verified: true }
+
     # ---- status / forget ----------------------------------------------------
 
     def status
@@ -157,10 +200,12 @@ module Sukhi
 
       if target == last
         log("up to date (#{target})")
+        @status = { state: "up_to_date" }
         return 0
       end
       if read_state("rejected").split.include?(target)
         log("target #{target} was rejected before; waiting for a newer commit")
+        @status = { state: "rejected", available: available(target) }
         return 0
       end
       if !last.empty? && !git("merge-base", "--is-ancestor", last, target).last.success?
@@ -174,6 +219,7 @@ module Sukhi
         verify_images(new_dir)
         preflight(new_dir)
         plan = make_plan(work, new_dir)
+        @status = { state: "update_available", available: available(target) }
 
         log("target #{target[0, 12]} (last-good #{last[0, 12]}), env=#{@sukhi_env}")
         log("restart: #{plan[:restart].empty? ? '(none)' : plan[:restart].join(' ')}")
@@ -225,6 +271,7 @@ module Sukhi
       if req.to_i > SYNC_API
         refuse("sukhi.version needs sukhi-gitops-sync API #{req} (this one is #{SYNC_API}); update sukhi-setup first")
       end
+      @target_version = manifest["version"].to_s
       Sukhi::Render.render_dir(manifest_path, new_dir)
       File.delete(manifest_path) # Quadlet のディレクトリには入れない
       new_dir
@@ -380,12 +427,15 @@ module Sukhi
         File.open(state_file("history"), "a") do |f|
           f.puts("#{Time.now.utc.strftime('%FT%TZ')} #{target} env=#{@sukhi_env} units=#{plan[:restart].join(' ')}")
         end
+        @status = { state: "up_to_date",
+                    applied: { "commit" => target, "version" => @target_version, "at" => Time.now.utc.iso8601 } }
         notify("sync ok #{target[0, 12]} (#{plan[:restart].empty? ? 'no units changed' : plan[:restart].join(' ')})")
         return 0
       end
 
       # 失敗: 見送りに記録して、前の状態に戻す(チェックアウトは進めていない)
       File.open(state_file("rejected"), "a") { |f| f.puts(target) }
+      @status = { state: "rejected", available: available(target) }
       if File.directory?(@applied)
         stage(@applied)
         swap_in
