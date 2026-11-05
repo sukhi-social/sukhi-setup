@@ -140,6 +140,23 @@ journalctl --user -u sukhi-gitops-sync -n 30
 - `available` は、署名と image の検証が通った版だけ。`error` のときは `null`。`applied` は動いている版で、`error` でも残る。
 - `last_error` は 300 文字まで。秘密は入れていない。
 
+### 管理画面の承認(`--approved`)
+
+timer は `--check`(提案を作る係)のまま回る。管理画面の承認だけが `--apply` を走らせる。
+
+```
+管理画面 [承認] → $XDG_RUNTIME_DIR/sukhi-approve/approve.json
+  → sukhi-gitops-approve.path が検知 → sukhi-gitops-approve.service
+  → sukhi-gitops-sync --apply --approved
+```
+
+- `approve.json` は `{ "commit": "<40桁>", "by": "<acct>", "at": "<iso8601>" }`。**署名・image・preflight・plan が全部通った後に**だけ見る。
+- 使えるのは、`commit` が今の検証済み target と同じで、`at` が 1 時間以内(`APPROVE_TTL_SECS`)のとき。通らなければ、使わずに捨てて `status.json` の `last_error` に理由を残す(承認があっても、検証は省かない)。
+- 適用に進んだ承認は history に `approved_by=<acct>` が付く。使い終わった承認は消える。
+- timer の `--check` と重なったら、終わるまで待つ(`APPROVE_LOCK_WAIT_SECS`、既定 120 秒)。
+- 置き場 `/run/user/<uid>/sukhi-approve` は再起動で消えるので、`tmpfiles.d/sukhi-approve.conf`(`~/.config/user-tmpfiles.d/`)が毎回作る。`public/`(gateway から ro)とは**別**。
+- path unit は、人が有効にする: `systemctl --user enable --now sukhi-gitops-approve.path`
+
 ## 7. 実機で確かめること(未確認の一覧)
 
 - ssh 署名の検証(gpg はテストで確認済み。ssh は「署名なしを断る」だけ)。

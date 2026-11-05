@@ -8,6 +8,7 @@
 #
 #   sukhi-gitops-sync [--check]                   # 既定。計画だけ。何も変えない
 #   sukhi-gitops-sync --apply [--clear-overrides]
+#   sukhi-gitops-sync --apply --approved          # 管理画面の承認(approve.json)があるときだけ適用
 #   sukhi-gitops-sync status
 #   sukhi-gitops-sync forget-rejected             # 見送った commit をもう一度対象にする
 #
@@ -41,9 +42,10 @@ module Sukhi
       '^https://github\.com/sukhi-social/sukhi-fedi/\.github/workflows/' \
       '(release\.yml@refs/tags/v.+|combined-sha\.yml@refs/heads/main)$'
 
-    def initialize(mode:, clear_overrides:, env: ENV)
+    def initialize(mode:, clear_overrides:, approved: false, env: ENV)
       @mode = mode
       @clear = clear_overrides
+      @approved = approved
       @env = env
       conf = read_conf(env.fetch("SUKHI_GITOPS_ENV", "/etc/sukhi/gitops.env"))
       @cfg = ->(key, default = nil) { env[key] || conf[key] || default }
@@ -64,6 +66,11 @@ module Sukhi
       @unit_order = @cfg.call("UNIT_ORDER", "sukhi-nats sukhi-gateway sukhi-web- sukhi-anubis").split
       @applied = File.join(@state, "applied")
       @public = File.join(@state, "public") # 管理画面(gateway)が読み取り専用で読む。秘密は置かない
+      # 承認の置き場。gateway だけが書く、public とは別のディレクトリ
+      @approve_file = File.join(@cfg.call("APPROVE_DIR", File.join(env["XDG_RUNTIME_DIR"] || "/run/user/#{Process.uid}", "sukhi-approve")), "approve.json")
+      @approve_ttl = Integer(@cfg.call("APPROVE_TTL_SECS", "3600"))
+      @lock_wait = Integer(@cfg.call("APPROVE_LOCK_WAIT_SECS", "120"))
+      @approved_by = nil
       @status = nil
       @target_version = nil
     end
@@ -78,7 +85,7 @@ module Sukhi
       refuse("no checkout at #{@infra} (run the setup's prepare-user.sh)") unless File.directory?(File.join(@infra, ".git"))
 
       File.open(File.join(@state, "lock"), File::RDWR | File::CREAT, 0o644) do |lock|
-        unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+        unless take_lock(lock)
           log("another run is in progress")
           return 0
         end
@@ -103,6 +110,19 @@ module Sukhi
     private
 
     # ---- 小道具 -------------------------------------------------------------
+
+    # 承認(--approved)は、timer の --check と重なっても落とさない。終わるまで少し待つ。
+    def take_lock(lock)
+      return true if lock.flock(File::LOCK_EX | File::LOCK_NB)
+      return false unless @approved
+
+      deadline = Time.now + @lock_wait
+      while Time.now < deadline
+        sleep(0.2)
+        return true if lock.flock(File::LOCK_EX | File::LOCK_NB)
+      end
+      false
+    end
 
     def log(msg) = puts("sukhi-gitops-sync: #{msg}")
 
@@ -201,6 +221,7 @@ module Sukhi
       if target == last
         log("up to date (#{target})")
         @status = { state: "up_to_date" }
+        discard_approval if @approved # 中身は見ない。もう要らない承認は捨てる
         return 0
       end
       if read_state("rejected").split.include?(target)
@@ -220,6 +241,11 @@ module Sukhi
         preflight(new_dir)
         plan = make_plan(work, new_dir)
         @status = { state: "update_available", available: available(target) }
+        # 承認は、署名・image・preflight・plan が全部済んだ後にだけ見る(順序を変えない)
+        if @approved && !approval_ok?(target)
+          discard_approval
+          return 0
+        end
 
         log("target #{target[0, 12]} (last-good #{last[0, 12]}), env=#{@sukhi_env}")
         log("restart: #{plan[:restart].empty? ? '(none)' : plan[:restart].join(' ')}")
@@ -228,8 +254,47 @@ module Sukhi
           log("check only; nothing changed. run with --apply")
           return 0
         end
-        apply(new_dir, plan, target, last)
+        begin
+          apply(new_dir, plan, target, last)
+        ensure
+          discard_approval if @approved
+        end
       end
+    end
+
+    # --- 承認(管理画面の「いま入れる」)---
+    # approve.json: { "commit": "<40桁>", "by": "<acct>", "at": "<iso8601>" }
+    # 使えるのは、commit が今の検証済み target と同じで、期限(既定 1 時間)内のときだけ。
+    # 通らなかった承認は使わずに捨て、status.json の last_error に理由を残す。
+    def approval_ok?(target)
+      doc = JSON.parse(File.read(@approve_file))
+      by = doc["by"].to_s
+      at = Time.iso8601(doc["at"].to_s)
+      return approval_refused("approval is malformed") unless doc["commit"].to_s.match?(/\A\h{40}\z/) && by.match?(/\A[\w@.+-]{1,100}\z/)
+      return approval_refused("approval is for #{doc['commit'][0, 12]}, but the target is now #{target[0, 12]}") unless doc["commit"] == target
+      age = Time.now - at
+      return approval_refused("approval expired (#{age.to_i}s old; limit #{@approve_ttl}s)") if age > @approve_ttl || age < -300
+
+      @approved_by = by
+      log("approved by #{by}")
+      true
+    rescue Errno::ENOENT
+      log("--approved, but there is no #{@approve_file}; nothing applied")
+      false
+    rescue JSON::ParserError, ArgumentError, TypeError
+      approval_refused("approval is malformed")
+    end
+
+    def approval_refused(msg)
+      log(msg)
+      @status = @status.merge(last_error: msg)
+      false
+    end
+
+    def discard_approval
+      File.delete(@approve_file)
+    rescue SystemCallError
+      nil
     end
 
     # --- 信頼 1: コミットの署名 ---
@@ -425,7 +490,7 @@ module Sukhi
         git!("reset", "-q", "--hard", target)
         File.write(state_file("last-good"), "#{target}\n")
         File.open(state_file("history"), "a") do |f|
-          f.puts("#{Time.now.utc.strftime('%FT%TZ')} #{target} env=#{@sukhi_env} units=#{plan[:restart].join(' ')}")
+          f.puts("#{Time.now.utc.strftime('%FT%TZ')} #{target} env=#{@sukhi_env} units=#{plan[:restart].join(' ')}#{@approved_by ? " approved_by=#{@approved_by}" : ''}")
         end
         @status = { state: "up_to_date",
                     applied: { "commit" => target, "version" => @target_version, "at" => Time.now.utc.iso8601 } }
@@ -465,12 +530,17 @@ if $PROGRAM_NAME == __FILE__
   when "status" then mode = :status
   when "forget-rejected" then mode = :forget
   else
-    warn "usage: #{File.basename($PROGRAM_NAME)} [--check|--apply [--clear-overrides]|status|forget-rejected]"
+    warn "usage: #{File.basename($PROGRAM_NAME)} [--check|--apply [--clear-overrides] [--approved]|status|forget-rejected]"
     exit 64
   end
-  clear = true if args.first == "--clear-overrides"
+  clear = args.delete("--clear-overrides") ? true : false
+  approved = args.delete("--approved") ? true : false
+  unless args.empty? && (!approved || mode == :apply)
+    warn "usage: --approved は --apply とだけ使える"
+    exit 64
+  end
   begin
-    exit Sukhi::GitopsSync.new(mode: mode, clear_overrides: clear).call
+    exit Sukhi::GitopsSync.new(mode: mode, clear_overrides: clear, approved: approved).call
   rescue Sukhi::Failed => e
     warn "sukhi-gitops-sync: #{e.message}"
     exit 1
