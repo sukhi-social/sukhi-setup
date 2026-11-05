@@ -24,7 +24,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 # 1. 置き場所
-mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user" "$HOME/.config/containers/systemd" "$HOME/.local/state/sukhi-gitops"
+mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user" "$HOME/.config/containers/systemd" "$HOME/.local/state/sukhi-gitops/public"
 install -m 755 "$here/bin/sukhi-gitops-sync" "$here/bin/sukhi-render" "$HOME/.local/bin/"
 install -m 644 "$here"/systemd/user/* "$HOME/.config/systemd/user/"
 
