@@ -132,3 +132,12 @@ journalctl --user -u sukhi-gitops-sync -n 30
 - Cockpit に `sukhi` で入って、コンテナと user の unit が見えること。
 - 非常時: `sukhi-fedi/scripts/sukhi-swap-image.sh` はドロップインを置く。次の同期で `--clear-overrides` が要る(意図した動き)。
 - 失敗時は表示された `next:` をそのまま確認する。root のコマンドと `sukhi` のコマンドを混ぜず、secret/volume を消す再初期化はしない。
+
+## 8. 動いている instance を引き継ぐとき
+
+§1〜§6 は新しい箱の準備。すでに動いている instance(sukhi.social など)を移すときは、次の四つを先に済ませる。コードを読んで確かめた(2026-11-05 時点)。
+
+1. **秘密は、起動の前に現行の値で作る。** `prepare-user.sh` の `mk_secret` は、無い名前(`erlang_cookie` `secret_key_base` `anubis_ed25519_key`)を乱数で作る。現行の値を `podman secret create` で先に入れてから流す。順を逆にすると、`secret_key_base` が変わってログインが切れ、anubis の鍵が変わって通行証が無効になる。
+2. **`/etc/sukhi/instance.json` は手で置く。** preflight は存在と非空を要求するが、`prepare-root.sh` も同期も作らない。中身は `overlays/<env>/instance.json` と同じにする。
+3. **最初の適用には戻し先が無い。** `applied`(前回の適用の記録)が無いと、同期は今の Quadlet を「手で置かれた上書き」とみなし、`--clear-overrides` を要求する。適用は、消える unit を先に止めてから入れ替える。ヘルスが通らなければ「戻す先が無い」と通知して止まる。動いている箱では、切り替えの前に旧の Quadlet を退避し、手で見ながら進める。
+4. **base は全環境に配られる。** 同期は base を重ねて全 unit を書き出すので、overlay では unit を止められない(例: `web-simple` `web-board`)。止めるには base から外すか、同期の仕組みを変える。
