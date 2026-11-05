@@ -64,10 +64,12 @@ fi
 chown -h root:root /etc/sukhi/infra
 
 if [ -n "$release" ]; then
+  # root が sukhi の持つ checkout を読むので、git の "dubious ownership" を、この呼び出しだけ許す(設定には書かない)
+  git_infra() { git -c safe.directory="$infra_dir" -C "$infra_dir" "$@"; }
   [ -d "$infra_dir/.git" ] || { echo "infra checkout missing: $infra_dir (run prepare-user.sh first)" >&2; exit 1; }
-  git -C "$infra_dir" cat-file -e "$release^{commit}" ||
+  git_infra cat-file -e "$release^{commit}" ||
     { echo "infra release is not a commit in $infra_dir: $release" >&2; exit 1; }
-  printf '%s\n' "$(git -C "$infra_dir" rev-parse "$release^{commit}")" > /etc/sukhi/release-revision
+  printf '%s\n' "$(git_infra rev-parse "$release^{commit}")" > /etc/sukhi/release-revision
   chmod 644 /etc/sukhi/release-revision
 fi
 
