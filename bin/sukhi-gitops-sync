@@ -326,10 +326,17 @@ module Sukhi
 
     # ---- 適用 ---------------------------------------------------------------
 
-    def swap_in(dir)
+    # 置き場所に書けるかは、unit を止める前に確かめる(書けないまま止めると、止めただけで終わる)
+    def stage(dir)
       FileUtils.rm_rf("#{@quadlet}.next")
       FileUtils.mkdir_p(File.dirname(@quadlet))
       FileUtils.cp_r(dir, "#{@quadlet}.next")
+    rescue SystemCallError => e
+      raise Failed, "cannot write #{@quadlet}.next (#{e.class.name.split('::').last}): #{e.message}. " \
+                    "#{File.dirname(@quadlet)} の持ち主と権限を確かめる(sukhi が書けること)。unit は何も止めていない"
+    end
+
+    def swap_in
       FileUtils.rm_rf("#{@quadlet}.prev")
       File.rename(@quadlet, "#{@quadlet}.prev") if File.exist?(@quadlet)
       File.rename("#{@quadlet}.next", @quadlet)
@@ -351,8 +358,9 @@ module Sukhi
     end
 
     def apply(new_dir, plan, target, last)
+      stage(new_dir)
       plan[:gone].each { |u| sctl("stop", "#{u}.service") }
-      swap_in(new_dir)
+      swap_in
       ok = sctl("daemon-reload") && restart_set(plan)
       if ok
         sleep(@hold)
@@ -379,7 +387,8 @@ module Sukhi
       # 失敗: 見送りに記録して、前の状態に戻す(チェックアウトは進めていない)
       File.open(state_file("rejected"), "a") { |f| f.puts(target) }
       if File.directory?(@applied)
-        swap_in(@applied)
+        stage(@applied)
+        swap_in
         sctl("daemon-reload")
         plan[:new].each { |u| sctl("stop", "#{u}.service") }
         rolled = plan[:restart].reject { |u| plan[:new].include?(u) }.map { |u| sctl("try-restart", "#{u}.service") }.all?
