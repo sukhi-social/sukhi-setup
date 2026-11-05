@@ -71,30 +71,29 @@ if [ -n "$release" ]; then
   chmod 644 /etc/sukhi/release-revision
 fi
 
-if [ -d "$infra_dir/stow/sukhi" ]; then
+# stow の package: 共通の `sukhi`(あれば)と、環境の `<env>`(instance.json など)。無い package は飛ばす
+packages=()
+for pkg in sukhi "$env_name"; do
+  [ -d "$infra_dir/stow/$pkg" ] && packages+=("$pkg")
+done
+if [ "${#packages[@]}" -gt 0 ]; then
   command -v stow >/dev/null 2>&1 || {
-    echo "GNU Stow is required for $infra_dir/stow/sukhi; install it, then rerun this script" >&2
+    echo "GNU Stow is required for $infra_dir/stow (${packages[*]}); install it, then rerun this script" >&2
     exit 1
   }
-  if find "$infra_dir/stow/sukhi" -type f -print | grep -Eiq '(^|/)(secret|secrets|credentials|allowed_signers)(\.|/|$)'; then
-    echo "refusing to Stow a secret-looking file; keep secrets in Podman secret" >&2
-    exit 1
-  fi
-  stow -n -v --no-folding --dir "$infra_dir/stow" --target /etc/sukhi sukhi
-  stow -v --no-folding --dir "$infra_dir/stow" --target /etc/sukhi sukhi
+  for pkg in "${packages[@]}"; do
+    if find "$infra_dir/stow/$pkg" \( -type f -o -type l \) -print | grep -Eiq '(^|/)(secret|secrets|credentials|allowed_signers)(\.|/|$)'; then
+      echo "refusing to Stow a secret-looking file in $pkg; keep secrets in Podman secret" >&2
+      exit 1
+    fi
+  done
+  stow -n -v --no-folding --dir "$infra_dir/stow" --target /etc/sukhi "${packages[@]}"
+  stow -v --no-folding --dir "$infra_dir/stow" --target /etc/sukhi "${packages[@]}"
 else
-  echo "note: no $infra_dir/stow/sukhi package; non-secret Stow entrypoint not installed yet"
+  echo "note: no $infra_dir/stow/{sukhi,$env_name} package; non-secret Stow entrypoint not installed yet"
 fi
-
-# instance.json: 無ければ infra の overlays/<env>/instance.json を写す(既存は上書きしない。stow が置いたものも守る)
-if [ ! -e /etc/sukhi/instance.json ]; then
-  if [ -f "$infra_dir/overlays/$env_name/instance.json" ]; then
-    install -m 644 "$infra_dir/overlays/$env_name/instance.json" /etc/sukhi/instance.json
-    echo "note: /etc/sukhi/instance.json を overlays/$env_name/instance.json から作った"
-  else
-    echo "note: /etc/sukhi/instance.json が無い。$infra_dir/overlays/$env_name/instance.json を見つけたら、もう一度流す" >&2
-  fi
-fi
+[ -e /etc/sukhi/instance.json ] ||
+  echo "note: /etc/sukhi/instance.json が無い。infra に stow/$env_name/instance.json が入ってから、もう一度流す" >&2
 
 echo "ok. 次: (1) sukhi のパスワードをパスワードマネージャーで作って passwd sukhi (Cockpit のログインに必須)"
 echo "    (2) /etc/sukhi/allowed_signers に署名者の公開鍵を (3) sukhi で prepare-user.sh"
