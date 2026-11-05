@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=sukhi: admin approved an update (approve.json written)
+
+[Path]
+# 管理画面(gateway)が書く(2b)。置き場は tmpfiles.d/sukhi-approve.conf が作る
+PathChanged=%t/sukhi-approve/approve.json
+Unit=sukhi-gitops-approve.service
+
+[Install]
+WantedBy=default.target

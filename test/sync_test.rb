@@ -128,7 +128,7 @@ class SyncTest < Minitest::Test
       "PATH" => "#{@bin}:#{ENV['PATH']}", "FAKE_LOG" => @log, "HOME" => File.join(@tmp, "home"),
       "SUKHI_GITOPS_ENV" => "/dev/null", "SUKHI_ENV" => "test", "INFRA_DIR" => File.join(@tmp, "infra"),
       "QUADLET_DIR" => @quadlet, "STATE_DIR" => @state, "VERIFY_COMMITS" => "none", "HOLD_SECS" => "0",
-      "PREFLIGHT" => "0",
+      "PREFLIGHT" => "0", "APPROVE_DIR" => File.join(@tmp, "approve"),
     }
   end
 
@@ -244,6 +244,86 @@ class SyncTest < Minitest::Test
     assert_equal "error", st["state"]
     assert_match(/placeholder digest/, st["last_error"])
     assert_nil st["available"]
+  end
+
+  # ---- 承認(--apply --approved) ----
+
+  def approve_file = File.join(@tmp, "approve", "approve.json")
+
+  def head = sh("git", "rev-parse", "HEAD", dir: @src).strip
+
+  def approve(commit: head, by: "kuro_admin", at: Time.now.utc.iso8601)
+    write(approve_file, JSON.generate({ commit: commit, by: by, at: at }))
+  end
+
+  def test_approved_apply_runs_and_consumes_the_approval
+    approve
+    assert_equal 0, run_sync("--apply", "--approved")
+    assert_equal "up_to_date", status_json["state"]
+    refute_empty calls
+    assert_match(/approved_by=kuro_admin/, File.read(File.join(@state, "history")))
+    refute File.exist?(approve_file)
+  end
+
+  def test_approved_without_a_file_applies_nothing
+    assert_equal 0, run_sync("--apply", "--approved")
+    assert_empty calls
+    assert_equal "update_available", status_json["state"]
+  end
+
+  def test_approval_for_another_commit_is_discarded
+    approve(commit: "f" * 40)
+    assert_equal 0, run_sync("--apply", "--approved")
+    assert_empty calls
+    assert_match(/approval is for ffffffffffff/, status_json["last_error"])
+    refute File.exist?(approve_file)
+  end
+
+  def test_expired_approval_is_discarded
+    approve(at: (Time.now.utc - 3601).iso8601)
+    assert_equal 0, run_sync("--apply", "--approved")
+    assert_empty calls
+    assert_match(/expired/, status_json["last_error"])
+    refute File.exist?(approve_file)
+  end
+
+  def test_malformed_approval_is_discarded
+    write(approve_file, "{nope")
+    assert_equal 0, run_sync("--apply", "--approved")
+    assert_empty calls
+    assert_match(/malformed/, status_json["last_error"])
+    refute File.exist?(approve_file)
+    approve(by: "a b; rm -rf /")
+    assert_equal 0, run_sync("--apply", "--approved")
+    assert_empty calls
+  end
+
+  def test_approval_never_overrides_a_failed_verification
+    run_sync("--apply")
+    manifest("test", "sha-ccccccc", ZERO, D2)
+    commit("c-ref")
+    approve
+    assert_equal 2, run_sync("--apply", "--approved")
+    assert_empty calls
+  end
+
+  def test_check_ignores_the_approval
+    approve
+    assert_equal 0, run_sync("--check")
+    assert_empty calls
+    assert File.exist?(approve_file)
+  end
+
+  def test_approved_is_only_for_apply
+    assert_equal 64, run_sync("--check", "--approved")
+  end
+
+  def test_approval_is_dropped_when_already_up_to_date
+    run_sync("--apply")
+    approve
+    assert_equal 0, run_sync("--apply", "--approved")
+    assert_empty calls
+    refute File.exist?(approve_file)
   end
 
   def test_status_json_reports_error_when_fetch_fails

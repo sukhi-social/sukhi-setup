@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=sukhi: apply the update the admin approved
+OnFailure=sukhi-gitops-notify@%n.service
+
+[Service]
+Type=oneshot
+Environment=LANG=C.UTF-8
+# 承認があっても、署名・image・preflight は通常と同じに確かめる。承認は、その後に見る。
+ExecStart=%h/.local/bin/sukhi-gitops-sync --apply --approved
+TimeoutStartSec=15min

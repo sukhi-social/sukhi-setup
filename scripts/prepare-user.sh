@@ -27,6 +27,10 @@ done
 mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user" "$HOME/.config/containers/systemd" "$HOME/.local/state/sukhi-gitops/public"
 install -m 755 "$here/bin/sukhi-gitops-sync" "$here/bin/sukhi-render" "$HOME/.local/bin/"
 install -m 644 "$here"/systemd/user/* "$HOME/.config/systemd/user/"
+# 管理画面の承認の置き場(/run/user/<uid>/sukhi-approve。再起動で消えるので tmpfiles で毎回作る)
+mkdir -p "$HOME/.config/user-tmpfiles.d"
+install -m 644 "$here"/tmpfiles.d/sukhi-approve.conf "$HOME/.config/user-tmpfiles.d/"
+systemd-tmpfiles --user --create "$HOME/.config/user-tmpfiles.d/sukhi-approve.conf"
 
 # 2. sukhi-infra を引く。https なら何も要らない。ssh の URL(private)のときだけ、読み取り専用 deploy key を作る(書き込み権限は付けない)
 key="$HOME/.ssh/sukhi-infra-deploy"
