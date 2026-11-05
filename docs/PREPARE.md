@@ -15,6 +15,7 @@ ruby -v
 podman --version      # この版を OPS_QUADLET_GITOPS.md §12-6 に書く(Notify=healthy 等が効くかの根拠)
 ```
 
+- `stow`(infra の `stow/<env>/` を `/etc/sukhi` に張る)は EPEL: `sudo dnf install -y epel-release && sudo dnf install -y stow`。
 - `cosign` は EPEL か公式の rpm(`dnf info cosign` で確かめる)。入れたものは OS の自動更新の対象になる(RUNTIME.md §12.4)。
 - Cockpit は **127.0.0.1 だけで待ち受ける**(RUNTIME.md §12.1 の `cockpit.socket.d/listen.conf`)。9090 番は開けない。SSH のトンネルで見る。
 
@@ -138,6 +139,6 @@ journalctl --user -u sukhi-gitops-sync -n 30
 §1〜§6 は新しい箱の準備。すでに動いている instance(sukhi.social など)を移すときは、次の四つを先に済ませる。コードを読んで確かめた(2026-11-05 時点)。
 
 1. **秘密は、起動の前に現行の値で作る。** `prepare-user.sh` の `mk_secret` は、無い名前(`erlang_cookie` `secret_key_base` `anubis_ed25519_key`)を乱数で作る。現行の値を `podman secret create` で先に入れてから流す。順を逆にすると、`secret_key_base` が変わってログインが切れ、anubis の鍵が変わって通行証が無効になる。
-2. **`/etc/sukhi/instance.json` は `prepare-root.sh` が写す。** infra checkout の `overlays/<env>/instance.json` を、無いときだけ写す(既存は触らない)。checkout より先に root を流した場合は、`prepare-user.sh` のあとにもう一度流す。
+2. **`/etc/sukhi/instance.json` は stow が張る。** `prepare-root.sh` が infra の `stow/<env>/` を `/etc/sukhi` に stow する(実体は `overlays/<env>/instance.json`)。infra の checkout より先に流した場合は、`prepare-user.sh` のあとにもう一度。stow が無い箱では `dnf install stow` が先。
 3. **最初の適用には戻し先が無い。** `applied`(前回の適用の記録)が無いと、同期は今の Quadlet を「手で置かれた上書き」とみなし、`--clear-overrides` を要求する。適用は、消える unit を先に止めてから入れ替える。ヘルスが通らなければ「戻す先が無い」と通知して止まる。動いている箱では、切り替えの前に旧の Quadlet を退避し、手で見ながら進める。
 4. **base は全環境に配られる。** 同期は base を重ねて全 unit を書き出すので、overlay では unit を止められない(例: `web-simple` `web-board`)。止めるには base から外すか、同期の仕組みを変える。overlay に移す案は、`check.rb` が overlay の `Image=` を禁じるので通らない。
