@@ -61,7 +61,7 @@ module Sukhi
       @allowed_signers = @cfg.call("ALLOWED_SIGNERS", "/etc/sukhi/allowed_signers")
       @verify_images = @cfg.call("VERIFY_IMAGES", "1") == "1"
       @signer_re = @cfg.call("SIGNER_RE", DEFAULT_SIGNER_RE)
-      @hold = Integer(@cfg.call("HOLD_SECS", "30"))
+      @hold = Integer(@cfg.call("HOLD_SECS", "10"))
       @notify_cmd = @cfg.call("NOTIFY_CMD", "")
       @unit_order = @cfg.call("UNIT_ORDER", "sukhi-nats sukhi-gateway sukhi-web- sukhi-anubis").split
       @applied = File.join(@state, "applied")
@@ -240,6 +240,7 @@ module Sukhi
         verify_images(new_dir)
         preflight(new_dir)
         plan = make_plan(work, new_dir)
+        prepull(new_dir, plan)
         @status = { state: "update_available", available: available(target) }
         # 承認は、署名・image・preflight・plan が全部済んだ後にだけ見る(順序を変えない)
         if @approved && !approval_ok?(target)
@@ -359,6 +360,26 @@ module Sukhi
                                 "--certificate-identity-regexp", @signer_re, ref)
         refuse("signature check failed for #{ref}") unless st.success?
         File.open(state_file("verified"), "a") { |f| f.puts(ref) }
+      end
+    end
+
+    # 承認を待つあいだに、入れ替える unit の image を引いておく(適用の窓から pull の時間を抜く)。
+    # 形と署名の検証が済んだ後にだけ呼ぶ。引けなくても同期は止めない(適用のとき unit が引く)。
+    def prepull(new_dir, plan)
+      return if @cfg.call("PREPULL", "1") == "0"
+
+      pulled = read_file(state_file("pulled")).split("\n")
+      images = Dir.glob(File.join(new_dir, "**", "*")).select { |f| File.file?(f) }
+                  .select { |f| plan[:restart].include?(unit_of(f.delete_prefix("#{new_dir}/"))) }
+                  .flat_map { |f| File.readlines(f, chomp: true).grep(/\AImage=/).map { |l| l.sub("Image=", "") } }.uniq
+      (images - pulled).each do |img|
+        log("pulling #{img}")
+        _, st = Open3.capture2e("podman", "pull", "-q", img)
+        if st.success?
+          File.open(state_file("pulled"), "a") { |f| f.puts(img) }
+        else
+          log("WARNING: could not pull #{img}; the unit will pull it at apply")
+        end
       end
     end
 

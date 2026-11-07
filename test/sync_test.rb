@@ -103,7 +103,7 @@ class SyncTest < Minitest::Test
     FileUtils.mkdir_p(@bin)
     # 偽物: systemctl は呼ばれ方を記録、podman inspect は FAKE_UNHEALTHY の unit だけ unhealthy、cosign は成功
     File.write(File.join(@bin, "systemctl"), "#!/bin/sh\necho \"$*\" >>\"$FAKE_LOG\"\n")
-    File.write(File.join(@bin, "podman"), "#!/bin/sh\nfor last; do :; done\ncase \" $FAKE_UNHEALTHY \" in *\" $last \"*) echo unhealthy;; *) echo healthy;; esac\n")
+    File.write(File.join(@bin, "podman"), "#!/bin/sh\n[ \"$1\" = pull ] && echo \"podman $*\" >>\"$FAKE_LOG\"\nfor last; do :; done\ncase \" $FAKE_UNHEALTHY \" in *\" $last \"*) echo unhealthy;; *) echo healthy;; esac\n")
     File.write(File.join(@bin, "cosign"), "#!/bin/sh\nexit 0\n")
     FileUtils.chmod(0o755, Dir.glob(File.join(@bin, "*")))
 
@@ -147,6 +147,31 @@ class SyncTest < Minitest::Test
     refute File.exist?(File.join(@quadlet, "overlays"))
     refute File.exist?(File.join(@quadlet, "sukhi.version"))
     refute_match(/\{\{/, Dir.glob(File.join(@quadlet, "**/*")).select { |f| File.file?(f) }.map { |f| File.read(f) }.join)
+  end
+
+  def pulls = File.readlines(@log, chomp: true).grep(/\Apodman pull/)
+
+  def test_check_prepulls_images_of_units_to_restart_once
+    assert_equal 0, run_sync("--check")
+    assert_equal 3, pulls.size
+    assert(pulls.all? { |l| l.match?(/@sha256:/) })
+    assert_equal 0, run_sync("--check") # run_sync は記録を空にして始める
+    assert_empty pulls # 引いたものは、もう引かない
+  end
+
+  def test_prepull_skips_units_that_do_not_change
+    run_sync("--apply")
+    manifest("test", "sha-aaaaaaa", D2, D1)
+    commit("c5")
+    run_sync("--check")
+    new = pulls.last(1)
+    assert_match(/sukhi-fedi-combined/, new.first)
+  end
+
+  def test_prepull_can_be_turned_off
+    @env["PREPULL"] = "0"
+    run_sync("--check")
+    assert_empty pulls
   end
 
   def test_up_to_date_is_a_noop
