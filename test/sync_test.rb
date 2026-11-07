@@ -217,6 +217,27 @@ class SyncTest < Minitest::Test
     assert_empty calls
   end
 
+  def test_rollback_starts_units_that_were_down
+    run_sync("--apply")
+    manifest("test", "sha-bbbbbbb", D2, D2)
+    commit("c5b")
+    assert_equal 1, run_sync("--apply", unhealthy: "sukhi-web-next")
+    # 止まっている unit は、前の版で起こす(try-restart は止まっているものには何もしない)
+    assert_equal ["try-restart sukhi-gateway.service", "try-restart sukhi-web-next.service",
+                  "restart sukhi-gateway.service", "restart sukhi-web-next.service"], calls
+  end
+
+  def test_rollback_starts_units_the_new_version_removed
+    run_sync("--apply")
+    File.delete(File.join(@src, "base", "sukhi-nats.container"))
+    manifest("test", "sha-bbbbbbb", D2, D2)
+    commit("c6")
+    assert_equal 1, run_sync("--apply", unhealthy: "sukhi-web-next")
+    # 新しい版で消えた unit は、前の版では動いていたので、戻すときに起こす(依存の先頭から)
+    assert_equal ["stop sukhi-nats.service", "try-restart sukhi-gateway.service", "try-restart sukhi-web-next.service",
+                  "restart sukhi-nats.service", "restart sukhi-gateway.service", "restart sukhi-web-next.service"], calls
+  end
+
   def status_json = JSON.parse(File.read(File.join(@state, "public", "status.json")))
 
   def test_status_json_reports_available_update_on_check

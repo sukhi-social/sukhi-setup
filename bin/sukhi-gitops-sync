@@ -527,7 +527,10 @@ module Sukhi
         swap_in
         sctl("daemon-reload")
         plan[:new].each { |u| sctl("stop", "#{u}.service") }
-        rolled = plan[:restart].reject { |u| plan[:new].include?(u) }.map { |u| sctl("try-restart", "#{u}.service") }.all?
+        # 前の版へ戻す。止まっている unit も起こす(try-restart は止まっているものには何もしない)。
+        # 新しい版で消えた unit は前の版では動いていたので、依存の先頭から起こす
+        back = (plan[:gone] + plan[:restart]).uniq - plan[:new]
+        rolled = back.map { |u| sctl("restart", "#{u}.service") }.all?
         if rolled
           notify("sync rejected #{target[0, 12]}: unhealthy; rolled back to #{last[0, 12]}")
         else
